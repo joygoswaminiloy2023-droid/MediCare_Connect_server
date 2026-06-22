@@ -75,30 +75,119 @@ router.get("/analytics", async (req, res) => {
 // =========================================================================
 // 2. MANAGE USERS
 // =========================================================================
+// =========================================================================
+// 2. MANAGE USERS
+// =========================================================================
 router.get("/users", async (req, res) => {
   try {
     const db = await connectToDatabase();
-    const users = await db.collection("user").find({}, { projection: { password: 0 } }).toArray();
+
+    // Auto-expire restrictions whose duration has passed
+    await db.collection("user").updateMany(
+      { status: "restricted", restrictedUntil: { $lte: new Date() } },
+      { $set: { status: "active" }, $unset: { restrictedUntil: "", restrictedAt: "" } }
+    );
+
+    const users = await db.collection("user").aggregate([
+      {
+        $lookup: {
+          from: "session",
+          let: { uid: "$_id", uidStr: { $toString: "$_id" } },
+          pipeline: [
+            { $match: { $expr: { $or: [{ $eq: ["$userId", "$$uid"] }, { $eq: ["$userId", "$$uidStr"] }] } } },
+            { $sort: { createdAt: -1 } },
+            { $limit: 1 },
+            { $project: { createdAt: 1, _id: 0 } }
+          ],
+          as: "lastSession"
+        }
+      },
+      {
+        $lookup: {
+          from: "Appointments",
+          let: { uid: "$_id", uidStr: { $toString: "$_id" } },
+          pipeline: [
+            { $match: { $expr: { $or: [{ $eq: ["$patientId", "$$uid"] }, { $eq: ["$patientId", "$$uidStr"] }] } } },
+            { $count: "total" }
+          ],
+          as: "appointmentStats"
+        }
+      },
+      {
+        $addFields: {
+          lastLogin: { $arrayElemAt: ["$lastSession.createdAt", 0] },
+          appointmentCount: { $ifNull: [{ $arrayElemAt: ["$appointmentStats.total", 0] }, 0] }
+        }
+      },
+      { $unset: ["password", "lastSession", "appointmentStats"] }
+    ]).toArray();
+
     res.status(200).json(users);
   } catch (error) {
+    console.error("Users aggregation error:", error);
     res.status(500).json({ success: false, message: "Failed to map user directory" });
   }
 });
 
-router.patch("/users/suspend/:id", async (req, res) => {
+// Temporary restriction — auto-expires after `days`
+router.patch("/users/restrict/:id", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const oid = toObjectId(req.params.id);
     if (!oid) return res.status(400).json({ success: false, message: "Invalid user ID." });
 
-    const user = await db.collection("user").findOne({ _id: oid });
-    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    const days = Number(req.body?.days);
+    if (!days || days <= 0) return res.status(400).json({ success: false, message: "Invalid restriction duration." });
 
-    const nextStatus = (user.status || "active") === "active" ? "suspended" : "active";
-    await db.collection("user").updateOne({ _id: oid }, { $set: { status: nextStatus } });
-    res.status(200).json({ success: true, nextStatus });
+    const restrictedUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+
+    const result = await db.collection("user").updateOne(
+      { _id: oid },
+      { $set: { status: "restricted", restrictedUntil, restrictedAt: new Date() } }
+    );
+    if (result.matchedCount === 0) return res.status(404).json({ success: false, message: "User not found." });
+
+    res.status(200).json({ success: true, status: "restricted", restrictedUntil });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Error modifying user status." });
+    res.status(500).json({ success: false, message: "Error restricting user." });
+  }
+});
+
+// Permanent ban
+router.patch("/users/ban/:id", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const oid = toObjectId(req.params.id);
+    if (!oid) return res.status(400).json({ success: false, message: "Invalid user ID." });
+
+    const result = await db.collection("user").updateOne(
+      { _id: oid },
+      { $set: { status: "banned", bannedAt: new Date() }, $unset: { restrictedUntil: "", restrictedAt: "" } }
+    );
+    if (result.matchedCount === 0) return res.status(404).json({ success: false, message: "User not found." });
+
+    res.status(200).json({ success: true, status: "banned" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Error banning user." });
+  }
+});
+
+// Undo — restores restricted or banned user back to active
+router.patch("/users/restore/:id", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const oid = toObjectId(req.params.id);
+    if (!oid) return res.status(400).json({ success: false, message: "Invalid user ID." });
+
+    const result = await db.collection("user").updateOne(
+      { _id: oid },
+      { $set: { status: "active" }, $unset: { restrictedUntil: "", restrictedAt: "", bannedAt: "" } }
+    );
+    if (result.matchedCount === 0) return res.status(404).json({ success: false, message: "User not found." });
+
+    res.status(200).json({ success: true, status: "active" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Error restoring user." });
   }
 });
 
@@ -155,7 +244,7 @@ router.patch("/doctors/verify/:id", async (req, res) => {
     const { verified } = req.body;
     const docId = req.params.id;
 
-    // ✅ Validate ObjectId FIRST — this was the crash cause
+
     const oid = toObjectId(docId);
     if (!oid) {
       return res.status(400).json({ success: false, message: "Invalid doctor ID format." });
