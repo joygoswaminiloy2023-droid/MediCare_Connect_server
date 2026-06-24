@@ -3,11 +3,32 @@ const router  = express.Router();
 const { connectToDatabase } = require("../lib/db");
 const { ObjectId } = require("mongodb");
 
+// ─── Helper: Update doctor's availableSlots ────────────────────────────
+async function updateDoctorAvailableSlots(db, doctorId) {
+  // Get all active schedules for this doctor
+  const schedules = await db.collection("DoctorSchedule")
+    .find({ 
+      doctorId: doctorId,
+      isActive: true 
+    })
+    .toArray();
+
+  // Format slots as "Day: Start - End"
+  const availableSlots = schedules.map(s => 
+    `${s.dayOfWeek}: ${s.startTime} - ${s.endTime}`
+  );
+
+  // Update the Doctor document
+  await db.collection("Doctor").updateOne(
+    { _id: doctorId },
+    { $set: { availableSlots } }
+  );
+
+  return availableSlots;
+}
 
 // =========================================================================
-// GET: ALL APPROVED DOCTORS with search & filter (rating/reviews are now
-// computed live from the "Reviews" collection via $lookup, instead of
-// reading a non-existent "rating" field stored on the Doctor document).
+// GET: ALL APPROVED DOCTORS with search & filter
 // =========================================================================
 router.get("/", async (req, res) => {
   try {
@@ -47,8 +68,6 @@ router.get("/", async (req, res) => {
 
     const pipeline = [
       { $match: match },
-
-      // Pull in this doctor's reviews from the "Reviews" collection
       {
         $lookup: {
           from: "Reviews",
@@ -57,12 +76,6 @@ router.get("/", async (req, res) => {
           as: "reviewDocs"
         }
       },
-
-      // Compute live rating average + review count.
-      // Doctors with zero reviews default to a rating of 4 — this MUST match
-      // the 4.00 placeholder shown on the frontend, otherwise unrated doctors
-      // would visually show 4.00 but still get excluded by the minRating
-      // match below (null never satisfies a $gte comparison).
       {
         $addFields: {
           reviews: { $size: "$reviewDocs" },
@@ -75,14 +88,9 @@ router.get("/", async (req, res) => {
           }
         }
       },
-
-      // Drop the raw review documents, we only needed them for the calc above
       { $project: { reviewDocs: 0 } }
     ];
 
-    // Only doctors meeting the minimum rating survive this filter.
-    // Unrated doctors default to rating 4 above, so they correctly pass
-    // "Any Rating" / "3.5 & above" / "4.0 & above", but not "4.5 & above".
     if (minRatingNum > 0) {
       pipeline.push({ $match: { rating: { $gte: minRatingNum } } });
     }
@@ -115,9 +123,7 @@ router.get("/", async (req, res) => {
   }
 });
 
-
 // GET: DISTINCT SPECIALIZATIONS
-
 router.get("/specializations", async (req, res) => {
   try {
     const db    = await connectToDatabase();
@@ -128,23 +134,18 @@ router.get("/specializations", async (req, res) => {
   }
 });
 
-
-// GET: DOCTOR DASHBOARD STATS (real data from DB)
-// GET /api/doctors/dashboard-stats/:email
-
+// GET: DOCTOR DASHBOARD STATS
 router.get("/dashboard-stats/:email", async (req, res) => {
   try {
     const db          = await connectToDatabase();
     const doctorEmail = req.params.email.trim().toLowerCase();
 
-    // Find doctor
     const doctor = await db.collection("Doctor").findOne({ email: doctorEmail });
     if (!doctor) return res.status(404).json({ success: false, message: "Doctor not found." });
 
     const doctorOid = doctor._id;
     const today     = new Date().toISOString().split("T")[0];
 
-    // Run all counts in parallel
     const [
       totalAppointments,
       pendingAppointments,
@@ -156,35 +157,18 @@ router.get("/dashboard-stats/:email", async (req, res) => {
       recentAppointments,
       avgRatingResult
     ] = await Promise.all([
-      // Total appointments for this doctor
       db.collection("Appointments").countDocuments({ doctorId: doctorOid }),
-
-      // Pending
       db.collection("Appointments").countDocuments({ doctorId: doctorOid, appointmentStatus: "pending" }),
-
-      // Confirmed
       db.collection("Appointments").countDocuments({ doctorId: doctorOid, appointmentStatus: "confirmed" }),
-
-      // Completed
       db.collection("Appointments").countDocuments({ doctorId: doctorOid, appointmentStatus: "completed" }),
-
-      // Today's appointments
       db.collection("Appointments").countDocuments({ doctorId: doctorOid, appointmentDate: today }),
-
-      // Unique patients (distinct patientId)
       db.collection("Appointments").distinct("patientId", { doctorId: doctorOid }),
-
-      // Total reviews
       db.collection("Reviews").countDocuments({ doctorId: doctorOid }),
-
-      // Recent 5 appointments
       db.collection("Appointments")
         .find({ doctorId: doctorOid })
         .sort({ createdAt: -1 })
         .limit(5)
         .toArray(),
-
-      // Average rating
       db.collection("Reviews").aggregate([
         { $match: { doctorId: doctorOid } },
         { $group: { _id: null, avg: { $avg: { $toDouble: "$rating" } } } }
@@ -211,9 +195,7 @@ router.get("/dashboard-stats/:email", async (req, res) => {
   }
 });
 
-
 // GET: DOCTOR'S APPOINTMENTS by email
-
 router.get("/appointments/:email", async (req, res) => {
   try {
     const db     = await connectToDatabase();
@@ -231,9 +213,7 @@ router.get("/appointments/:email", async (req, res) => {
   }
 });
 
-
 // PATCH: ACCEPT appointment
-
 router.patch("/appointments/:id/accept", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -247,9 +227,7 @@ router.patch("/appointments/:id/accept", async (req, res) => {
   }
 });
 
-
 // PATCH: REJECT appointment
-
 router.patch("/appointments/:id/reject", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -263,9 +241,7 @@ router.patch("/appointments/:id/reject", async (req, res) => {
   }
 });
 
-
 // POST: SAVE PRESCRIPTION
-
 router.post("/prescriptions", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -274,7 +250,6 @@ router.post("/prescriptions", async (req, res) => {
     if (!doctorId || !appointmentId || !diagnosis)
       return res.status(400).json({ success: false, message: "doctorId, appointmentId and diagnosis are required." });
 
-    // Save to Prescriptions (exact schema match)
     const result = await db.collection("Prescriptions").insertOne({
       doctorId:      new ObjectId(doctorId),
       patientId:     patientId ? new ObjectId(patientId) : null,
@@ -285,7 +260,6 @@ router.post("/prescriptions", async (req, res) => {
       createdAt:     new Date()
     });
 
-    // Mark appointment completed
     await db.collection("Appointments").updateOne(
       { _id: new ObjectId(appointmentId) },
       { $set: { appointmentStatus: "completed", updatedAt: new Date() } }
@@ -298,9 +272,7 @@ router.post("/prescriptions", async (req, res) => {
   }
 });
 
-
 // GET: DOCTOR'S PRESCRIPTIONS
-
 router.get("/prescriptions/:doctorId", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -314,9 +286,7 @@ router.get("/prescriptions/:doctorId", async (req, res) => {
   }
 });
 
-
 // POST: SUBMIT PRACTITIONER APPLICATION
-
 router.post("/profile", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -360,9 +330,7 @@ router.post("/profile", async (req, res) => {
   }
 });
 
-
 // GET: CHECK PROFILE / APPLICATION STATUS by email
-
 router.get("/profile/:email", async (req, res) => {
   try {
     const db          = await connectToDatabase();
@@ -377,9 +345,8 @@ router.get("/profile/:email", async (req, res) => {
   }
 });
 
-
 // =========================================================================
-// POST: CREATE DOCTOR SCHEDULE
+// POST: CREATE DOCTOR SCHEDULE (UPDATED with availableSlots update)
 // =========================================================================
 router.post("/schedule", async (req, res) => {
   try {
@@ -390,7 +357,30 @@ router.post("/schedule", async (req, res) => {
       return res.status(400).json({ success: false, message: "Missing required fields." });
     }
 
+    // Get the doctor first to get their ObjectId
+    const doctor = await db.collection("Doctor").findOne({ email: doctorEmail.toLowerCase() });
+    if (!doctor) {
+      return res.status(404).json({ success: false, message: "Doctor not found." });
+    }
+
+    // Check if schedule already exists
+    const existing = await db.collection("DoctorSchedule").findOne({
+      doctorId: doctor._id,
+      dayOfWeek,
+      startTime,
+      endTime
+    });
+
+    if (existing) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "This time slot already exists for this day" 
+      });
+    }
+
+    // Create schedule with doctorId
     const result = await db.collection("DoctorSchedule").insertOne({
+      doctorId: doctor._id,
       doctorEmail: doctorEmail.toLowerCase(),
       dayOfWeek,
       startTime,
@@ -399,23 +389,37 @@ router.post("/schedule", async (req, res) => {
       createdAt: new Date()
     });
 
-    res.status(201).json({ success: true, scheduleId: result.insertedId });
+    // Update doctor's availableSlots
+    const availableSlots = await updateDoctorAvailableSlots(db, doctor._id);
+
+    res.status(201).json({ 
+      success: true, 
+      scheduleId: result.insertedId,
+      availableSlots 
+    });
   } catch (error) {
     console.error("Schedule creation failed:", error);
     res.status(500).json({ success: false, message: "Failed to create schedule." });
   }
 });
 
-
 // =========================================================================
-// GET: DOCTOR'S SCHEDULES
+// GET: DOCTOR'S SCHEDULES (UPDATED with doctorId lookup)
 // =========================================================================
 router.get("/schedule/:doctorEmail", async (req, res) => {
   try {
     const db = await connectToDatabase();
+    const doctorEmail = req.params.doctorEmail.toLowerCase();
+    
+    // Get the doctor first
+    const doctor = await db.collection("Doctor").findOne({ email: doctorEmail });
+    if (!doctor) {
+      return res.status(404).json({ success: false, message: "Doctor not found." });
+    }
+
     const schedules = await db.collection("DoctorSchedule")
-      .find({ doctorEmail: req.params.doctorEmail.toLowerCase() })
-      .sort({ createdAt: -1 })
+      .find({ doctorId: doctor._id })
+      .sort({ dayOfWeek: 1, startTime: 1 })
       .toArray();
 
     res.status(200).json({ success: true, schedules });
@@ -425,14 +429,14 @@ router.get("/schedule/:doctorEmail", async (req, res) => {
   }
 });
 
-
 // =========================================================================
-// PATCH: UPDATE SCHEDULE
+// PATCH: UPDATE SCHEDULE (UPDATED with availableSlots update)
 // =========================================================================
 router.patch("/schedule/:scheduleId", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const { dayOfWeek, startTime, endTime, isActive } = req.body;
+    const scheduleId = req.params.scheduleId;
 
     const updateData = {};
     if (dayOfWeek !== undefined) updateData.dayOfWeek = dayOfWeek;
@@ -442,7 +446,7 @@ router.patch("/schedule/:scheduleId", async (req, res) => {
     updateData.updatedAt = new Date();
 
     const result = await db.collection("DoctorSchedule").updateOne(
-      { _id: new ObjectId(req.params.scheduleId) },
+      { _id: new ObjectId(scheduleId) },
       { $set: updateData }
     );
 
@@ -450,48 +454,70 @@ router.patch("/schedule/:scheduleId", async (req, res) => {
       return res.status(404).json({ success: false, message: "Schedule not found." });
     }
 
-    res.status(200).json({ success: true, message: "Schedule updated." });
+    // Get the updated schedule to find the doctor
+    const updatedSchedule = await db.collection("DoctorSchedule").findOne({ _id: new ObjectId(scheduleId) });
+    
+    // Update doctor's availableSlots
+    let availableSlots = [];
+    if (updatedSchedule) {
+      availableSlots = await updateDoctorAvailableSlots(db, updatedSchedule.doctorId);
+    }
+
+    res.status(200).json({ 
+      success: true, 
+      message: isActive ? "Schedule enabled" : "Schedule disabled",
+      availableSlots 
+    });
   } catch (error) {
     console.error("Update failed:", error);
     res.status(500).json({ success: false, message: "Failed to update schedule." });
   }
 });
 
-
 // =========================================================================
-// DELETE: SCHEDULE
+// DELETE: SCHEDULE (UPDATED with availableSlots update)
 // =========================================================================
 router.delete("/schedule/:scheduleId", async (req, res) => {
   try {
     const db = await connectToDatabase();
+    const scheduleId = req.params.scheduleId;
+
+    // Get the schedule first to find the doctor
+    const schedule = await db.collection("DoctorSchedule").findOne({ _id: new ObjectId(scheduleId) });
+    if (!schedule) {
+      return res.status(404).json({ success: false, message: "Schedule not found." });
+    }
 
     const result = await db.collection("DoctorSchedule").deleteOne({
-      _id: new ObjectId(req.params.scheduleId)
+      _id: new ObjectId(scheduleId)
     });
 
     if (result.deletedCount === 0) {
       return res.status(404).json({ success: false, message: "Schedule not found." });
     }
 
-    res.status(200).json({ success: true, message: "Schedule deleted." });
+    // Update doctor's availableSlots
+    const availableSlots = await updateDoctorAvailableSlots(db, schedule.doctorId);
+
+    res.status(200).json({ 
+      success: true, 
+      message: "Schedule deleted.",
+      availableSlots 
+    });
   } catch (error) {
     console.error("Delete failed:", error);
     res.status(500).json({ success: false, message: "Failed to delete schedule." });
   }
 });
 
-
 // =========================================================================
-// GET: FEATURED REVIEWS ACROSS ALL DOCTORS (for homepage testimonials)
-// IMPORTANT: this route is registered BEFORE "/reviews/:doctorId" below —
-// if it came after, Express would match "/reviews/featured" against the
-// dynamic route instead and try (and fail) to cast "featured" to an ObjectId.
+// GET: FEATURED REVIEWS
 // =========================================================================
 router.get("/reviews/featured", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const limitNum     = Math.min(20, Math.max(1, Number(req.query.limit) || 6));
-    const minRatingNum = Number(req.query.minRating) || 4; // only surface solid reviews by default
+    const minRatingNum = Number(req.query.minRating) || 4;
 
     const reviews = await db.collection("Reviews").aggregate([
       {
@@ -502,8 +528,6 @@ router.get("/reviews/featured", async (req, res) => {
       },
       { $sort: { rating: -1, createdAt: -1 } },
       { $limit: limitNum },
-
-      // Pull in the doctor this review was about
       {
         $lookup: {
           from: "Doctor",
@@ -512,10 +536,6 @@ router.get("/reviews/featured", async (req, res) => {
           as: "doctorInfo"
         }
       },
-
-      // Reviews only stores patientEmail, not a display name. The
-      // appointment captured at booking time is the most likely place
-      // a real patient name would have been recorded, so try that first.
       {
         $lookup: {
           from: "Appointments",
@@ -524,14 +544,12 @@ router.get("/reviews/featured", async (req, res) => {
           as: "appointmentInfo"
         }
       },
-
       {
         $addFields: {
           doctorInfo:      { $arrayElemAt: ["$doctorInfo", 0] },
           appointmentInfo: { $arrayElemAt: ["$appointmentInfo", 0] }
         }
       },
-
       {
         $project: {
           _id: 1,
@@ -539,8 +557,6 @@ router.get("/reviews/featured", async (req, res) => {
           reviewText: 1,
           createdAt: 1,
           patientEmail: 1,
-          // null if the Appointments schema doesn't actually have these
-          // fields — the frontend falls back to deriving a name from the email
           patientName: {
             $ifNull: ["$appointmentInfo.patientName", "$appointmentInfo.name"]
           },
@@ -557,9 +573,8 @@ router.get("/reviews/featured", async (req, res) => {
   }
 });
 
-
 // =========================================================================
-// GET: DOCTOR'S REVIEWS (for cards display / doctor profile page)
+// GET: DOCTOR'S REVIEWS
 // =========================================================================
 router.get("/reviews/:doctorId", async (req, res) => {
   try {
@@ -571,7 +586,6 @@ router.get("/reviews/:doctorId", async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
-    // Calculate average rating
     const avgRating = reviews.length > 0
       ? (reviews.reduce((sum, r) => sum + (Number(r.rating) || 0), 0) / reviews.length).toFixed(1)
       : 0;
