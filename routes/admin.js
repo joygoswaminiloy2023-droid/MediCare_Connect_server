@@ -3,7 +3,6 @@ const router = express.Router();
 const { connectToDatabase } = require("../lib/db");
 const { ObjectId } = require("mongodb");
 
-
 function toObjectId(id) {
   try {
     return new ObjectId(id);
@@ -12,11 +11,9 @@ function toObjectId(id) {
   }
 }
 
-
-
+// =========================================================================
 // 1. ANALYTICS & RECHARTS DATA ENGINE
-
-
+// =========================================================================
 router.get("/analytics", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -24,14 +21,59 @@ router.get("/analytics", async (req, res) => {
     const totalPatients = await db.collection("user").countDocuments({ role: "patient" });
     const totalDoctors = await db.collection("Doctor").countDocuments();
     const totalAppointments = await db.collection("Appointments").countDocuments();
+    
+    // ── Get Reviews Statistics ──────────────────────────────────────────
+    const totalReviews = await db.collection("Reviews").countDocuments();
+    
+    // Calculate average rating
+    const avgRatingResult = await db.collection("Reviews").aggregate([
+      { $group: { _id: null, averageRating: { $avg: "$rating" } } }
+    ]).toArray();
+    
+    const averageRating = avgRatingResult.length > 0 
+      ? parseFloat(avgRatingResult[0].averageRating.toFixed(1)) 
+      : 0;
 
-    const paymentRecords = await db.collection("Payments").find({}).toArray();
-    const totalRevenue = paymentRecords.reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
+    // Get recent reviews (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const recentReviews = await db.collection("Reviews").countDocuments({
+      createdAt: { $gte: thirtyDaysAgo }
+    });
 
+    // Get previous month reviews for growth calculation
+    const sixtyDaysAgo = new Date();
+    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+    
+    const previousMonthReviews = await db.collection("Reviews").countDocuments({
+      createdAt: { 
+        $gte: sixtyDaysAgo,
+        $lt: thirtyDaysAgo
+      }
+    });
+
+    // Calculate review growth percentage
+    let reviewGrowth = "+0%";
+    if (previousMonthReviews > 0) {
+      const growth = ((recentReviews - previousMonthReviews) / previousMonthReviews) * 100;
+      reviewGrowth = `${growth >= 0 ? '+' : ''}${Math.round(growth)}%`;
+    } else if (recentReviews > 0) {
+      reviewGrowth = "+100%";
+    }
+
+    // ── Doctor Performance from Reviews ────────────────────────────────
     let doctorPerformance = [];
     try {
       doctorPerformance = await db.collection("Reviews").aggregate([
-        { $group: { _id: "$doctorId", averageRating: { $avg: { $toDouble: "$rating" } }, totalReviews: { $sum: 1 } } },
+        { 
+          $group: { 
+            _id: "$doctorId", 
+            averageRating: { $avg: { $toDouble: "$rating" } }, 
+            totalReviews: { $sum: 1 } 
+          } 
+        },
+        { $sort: { averageRating: -1 } },
         { $limit: 5 }
       ]).toArray();
     } catch (e) {
@@ -48,7 +90,11 @@ router.get("/analytics", async (req, res) => {
             if (doc) name = doc.doctorName;
           }
         } catch {}
-        return { name, rating: parseFloat(perf.averageRating.toFixed(1)), reviews: perf.totalReviews };
+        return { 
+          name, 
+          rating: parseFloat(perf.averageRating.toFixed(1)), 
+          reviews: perf.totalReviews 
+        };
       })
     );
 
@@ -59,14 +105,27 @@ router.get("/analytics", async (req, res) => {
       { name: "Dr. Anisur Rahman", rating: 4.6, reviews: 85 }
     ];
 
+    // ── Response ────────────────────────────────────────────────────────
     res.status(200).json({
       stats: [
         { id: 1, name: "Total Patients", value: totalPatients, change: "+12%", changeType: "increase" },
         { id: 2, name: "Total Doctors", value: totalDoctors, change: "+4%", changeType: "increase" },
         { id: 3, name: "Total Appointments", value: totalAppointments, change: "+22%", changeType: "increase" },
-        { id: 4, name: "Total Revenue", value: `$${totalRevenue}`, change: "+8%", changeType: "increase" },
+        { 
+          id: 4, 
+          name: "Reviews Received", 
+          value: totalReviews, 
+          change: reviewGrowth, 
+          changeType: "increase" 
+        },
       ],
-      performanceData: finalPerformanceData
+      performanceData: finalPerformanceData,
+      reviewStats: {
+        total: totalReviews,
+        averageRating: averageRating,
+        recentReviews: recentReviews,
+        growth: reviewGrowth
+      }
     });
   } catch (error) {
     console.error("Analytics error:", error);
@@ -74,15 +133,9 @@ router.get("/analytics", async (req, res) => {
   }
 });
 
-
-
-
-
-
-
+// =========================================================================
 // 2. MANAGE USERS
-
-
+// =========================================================================
 router.get("/users", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -134,7 +187,7 @@ router.get("/users", async (req, res) => {
   }
 });
 
-// Temporary restriction 
+// Temporary restriction
 router.patch("/users/restrict/:id", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -177,7 +230,7 @@ router.patch("/users/ban/:id", async (req, res) => {
   }
 });
 
-// Undo
+// Undo / Restore user
 router.patch("/users/restore/:id", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -209,13 +262,9 @@ router.delete("/users/:id", async (req, res) => {
   }
 });
 
-
-
+// =========================================================================
 // 3. MANAGE MEDICAL PRACTITIONERS
-
-
-
-
+// =========================================================================
 router.get("/doctors", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -244,13 +293,12 @@ router.get("/doctors", async (req, res) => {
   }
 });
 
-// PATCH: Approve 
+// PATCH: Approve/Revoke doctor verification
 router.patch("/doctors/verify/:id", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const { verified } = req.body;
     const docId = req.params.id;
-
 
     const oid = toObjectId(docId);
     if (!oid) {
@@ -258,7 +306,7 @@ router.patch("/doctors/verify/:id", async (req, res) => {
     }
 
     if (verified) {
-  
+      // APPROVE: Move from DoctorApplications to Doctor
       const application = await db.collection("DoctorApplications").findOne({ _id: oid });
 
       if (!application) {
@@ -268,13 +316,13 @@ router.patch("/doctors/verify/:id", async (req, res) => {
         });
       }
 
-      const { _id, createdAt, ...applicationData } = application; // strip _id AND createdAt to avoid conflict
+      const { _id, createdAt, ...applicationData } = application;
 
       await db.collection("Doctor").updateOne(
         { email: applicationData.email },
         {
           $set: { ...applicationData, verificationStatus: "verified", approvedAt: new Date() },
-          $setOnInsert: { createdAt: createdAt || new Date() } // only set on first insert, no conflict
+          $setOnInsert: { createdAt: createdAt || new Date() }
         },
         { upsert: true }
       );
@@ -291,7 +339,7 @@ router.patch("/doctors/verify/:id", async (req, res) => {
         return res.status(404).json({ success: false, message: "Live doctor record not found." });
       }
 
-      const { _id, createdAt, ...doctorData } = liveDoctor; // strip _id AND createdAt to avoid conflict
+      const { _id, createdAt, ...doctorData } = liveDoctor;
 
       await db.collection("DoctorApplications").updateOne(
         { email: doctorData.email },
@@ -327,11 +375,9 @@ router.delete("/doctors/reject/:id", async (req, res) => {
   }
 });
 
-
-
+// =========================================================================
 // 4. BOOKINGS & FINANCIAL AUDITING
-
-
+// =========================================================================
 router.get("/appointments", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -359,11 +405,8 @@ router.get("/payments", async (req, res) => {
     const db = await connectToDatabase();
     const payments = await db.collection("Payments").find({}).toArray();
 
-    // Enrich payments with Patient and Doctor names
     const enrichedPayments = await Promise.all(payments.map(async (payment) => {
-      // Find the patient
       const patient = await db.collection("user").findOne({ _id: toObjectId(payment.patientId) });
-      // Find the doctor (assuming the collection is named "Doctor")
       const doctor = await db.collection("Doctor").findOne({ _id: toObjectId(payment.doctorId) });
 
       return {
