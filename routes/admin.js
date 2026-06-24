@@ -3,7 +3,7 @@ const router = express.Router();
 const { connectToDatabase } = require("../lib/db");
 const { ObjectId } = require("mongodb");
 
-// ── Safe ObjectId helper — prevents crashes on malformed IDs ──────────────────
+
 function toObjectId(id) {
   try {
     return new ObjectId(id);
@@ -12,9 +12,11 @@ function toObjectId(id) {
   }
 }
 
-// =========================================================================
+
+
 // 1. ANALYTICS & RECHARTS DATA ENGINE
-// =========================================================================
+
+
 router.get("/analytics", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -72,12 +74,15 @@ router.get("/analytics", async (req, res) => {
   }
 });
 
-// =========================================================================
+
+
+
+
+
+
 // 2. MANAGE USERS
-// =========================================================================
-// =========================================================================
-// 2. MANAGE USERS
-// =========================================================================
+
+
 router.get("/users", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -129,7 +134,7 @@ router.get("/users", async (req, res) => {
   }
 });
 
-// Temporary restriction — auto-expires after `days`
+// Temporary restriction 
 router.patch("/users/restrict/:id", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -172,7 +177,7 @@ router.patch("/users/ban/:id", async (req, res) => {
   }
 });
 
-// Undo — restores restricted or banned user back to active
+// Undo
 router.patch("/users/restore/:id", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -204,11 +209,13 @@ router.delete("/users/:id", async (req, res) => {
   }
 });
 
-// =========================================================================
-// 3. MANAGE MEDICAL PRACTITIONERS
-// =========================================================================
 
-// GET all doctors for admin panel (pending first, then verified)
+
+// 3. MANAGE MEDICAL PRACTITIONERS
+
+
+
+
 router.get("/doctors", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -237,7 +244,7 @@ router.get("/doctors", async (req, res) => {
   }
 });
 
-// PATCH: Approve (verified: true) or Revoke (verified: false)
+// PATCH: Approve 
 router.patch("/doctors/verify/:id", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -251,7 +258,7 @@ router.patch("/doctors/verify/:id", async (req, res) => {
     }
 
     if (verified) {
-      // APPROVE: DoctorApplications → Doctor (live)
+  
       const application = await db.collection("DoctorApplications").findOne({ _id: oid });
 
       if (!application) {
@@ -320,14 +327,28 @@ router.delete("/doctors/reject/:id", async (req, res) => {
   }
 });
 
-// =========================================================================
+
+
 // 4. BOOKINGS & FINANCIAL AUDITING
-// =========================================================================
+
+
 router.get("/appointments", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const appointments = await db.collection("Appointments").find({}).toArray();
-    res.status(200).json(appointments);
+
+    const enrichedAppointments = await Promise.all(appointments.map(async (appt) => {
+      const patient = await db.collection("user").findOne({ _id: toObjectId(appt.patientId) });
+      const doctor = await db.collection("Doctor").findOne({ _id: toObjectId(appt.doctorId) });
+      
+      return {
+        ...appt,
+        patientName: patient?.name || "Unknown Patient",
+        doctorName: doctor?.doctorName || doctor?.name || "Unassigned"
+      };
+    }));
+
+    res.status(200).json(enrichedAppointments);
   } catch (error) {
     res.status(500).json({ success: false, message: "Error fetching appointments." });
   }
@@ -337,8 +358,24 @@ router.get("/payments", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const payments = await db.collection("Payments").find({}).toArray();
-    res.status(200).json(payments);
+
+    // Enrich payments with Patient and Doctor names
+    const enrichedPayments = await Promise.all(payments.map(async (payment) => {
+      // Find the patient
+      const patient = await db.collection("user").findOne({ _id: toObjectId(payment.patientId) });
+      // Find the doctor (assuming the collection is named "Doctor")
+      const doctor = await db.collection("Doctor").findOne({ _id: toObjectId(payment.doctorId) });
+
+      return {
+        ...payment,
+        patientName: patient?.name || "Anonymous Patient",
+        doctorName: doctor?.doctorName || doctor?.name || "Unassigned"
+      };
+    }));
+
+    res.status(200).json(enrichedPayments);
   } catch (error) {
+    console.error("Payment enrichment error:", error);
     res.status(500).json({ success: false, message: "Failed to fetch payments." });
   }
 });

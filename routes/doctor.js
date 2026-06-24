@@ -3,9 +3,9 @@ const router  = express.Router();
 const { connectToDatabase } = require("../lib/db");
 const { ObjectId } = require("mongodb");
 
-// =========================================================================
+
 // GET: ALL APPROVED DOCTORS with search & filter
-// =========================================================================
+
 router.get("/", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -45,9 +45,9 @@ router.get("/", async (req, res) => {
   }
 });
 
-// =========================================================================
+
 // GET: DISTINCT SPECIALIZATIONS
-// =========================================================================
+
 router.get("/specializations", async (req, res) => {
   try {
     const db    = await connectToDatabase();
@@ -58,10 +58,10 @@ router.get("/specializations", async (req, res) => {
   }
 });
 
-// =========================================================================
+
 // GET: DOCTOR DASHBOARD STATS (real data from DB)
 // GET /api/doctors/dashboard-stats/:email
-// =========================================================================
+
 router.get("/dashboard-stats/:email", async (req, res) => {
   try {
     const db          = await connectToDatabase();
@@ -141,9 +141,9 @@ router.get("/dashboard-stats/:email", async (req, res) => {
   }
 });
 
-// =========================================================================
+
 // GET: DOCTOR'S APPOINTMENTS by email
-// =========================================================================
+
 router.get("/appointments/:email", async (req, res) => {
   try {
     const db     = await connectToDatabase();
@@ -161,9 +161,9 @@ router.get("/appointments/:email", async (req, res) => {
   }
 });
 
-// =========================================================================
+
 // PATCH: ACCEPT appointment
-// =========================================================================
+
 router.patch("/appointments/:id/accept", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -177,9 +177,9 @@ router.patch("/appointments/:id/accept", async (req, res) => {
   }
 });
 
-// =========================================================================
+
 // PATCH: REJECT appointment
-// =========================================================================
+
 router.patch("/appointments/:id/reject", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -193,10 +193,9 @@ router.patch("/appointments/:id/reject", async (req, res) => {
   }
 });
 
-// =========================================================================
-// POST: SAVE PRESCRIPTION → also marks appointment as "completed"
-// Saves to Prescriptions collection (your schema)
-// =========================================================================
+
+// POST: SAVE PRESCRIPTION
+
 router.post("/prescriptions", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -229,9 +228,9 @@ router.post("/prescriptions", async (req, res) => {
   }
 });
 
-// =========================================================================
+
 // GET: DOCTOR'S PRESCRIPTIONS
-// =========================================================================
+
 router.get("/prescriptions/:doctorId", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -245,9 +244,9 @@ router.get("/prescriptions/:doctorId", async (req, res) => {
   }
 });
 
-// =========================================================================
+
 // POST: SUBMIT PRACTITIONER APPLICATION
-// =========================================================================
+
 router.post("/profile", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -291,9 +290,9 @@ router.post("/profile", async (req, res) => {
   }
 });
 
-// =========================================================================
+
 // GET: CHECK PROFILE / APPLICATION STATUS by email
-// =========================================================================
+
 router.get("/profile/:email", async (req, res) => {
   try {
     const db          = await connectToDatabase();
@@ -305,6 +304,109 @@ router.get("/profile/:email", async (req, res) => {
     return res.status(404).json({ success: false, message: "No profile registered yet." });
   } catch (error) {
     res.status(500).json({ success: false, message: "Error looking up doctor profile." });
+  }
+});
+
+
+// =========================================================================
+// POST: CREATE DOCTOR SCHEDULE
+// =========================================================================
+router.post("/schedule", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const { doctorEmail, dayOfWeek, startTime, endTime } = req.body;
+
+    if (!doctorEmail || !dayOfWeek || !startTime || !endTime) {
+      return res.status(400).json({ success: false, message: "Missing required fields." });
+    }
+
+    const result = await db.collection("DoctorSchedule").insertOne({
+      doctorEmail: doctorEmail.toLowerCase(),
+      dayOfWeek,
+      startTime,
+      endTime,
+      isActive: true,
+      createdAt: new Date()
+    });
+
+    res.status(201).json({ success: true, scheduleId: result.insertedId });
+  } catch (error) {
+    console.error("Schedule creation failed:", error);
+    res.status(500).json({ success: false, message: "Failed to create schedule." });
+  }
+});
+
+
+// =========================================================================
+// GET: DOCTOR'S SCHEDULES
+// =========================================================================
+router.get("/schedule/:doctorEmail", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const schedules = await db.collection("DoctorSchedule")
+      .find({ doctorEmail: req.params.doctorEmail.toLowerCase() })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({ success: true, schedules });
+  } catch (error) {
+    console.error("Failed to fetch schedules:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch schedules." });
+  }
+});
+
+
+// =========================================================================
+// PATCH: UPDATE SCHEDULE
+// =========================================================================
+router.patch("/schedule/:scheduleId", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const { dayOfWeek, startTime, endTime, isActive } = req.body;
+
+    const updateData = {};
+    if (dayOfWeek !== undefined) updateData.dayOfWeek = dayOfWeek;
+    if (startTime !== undefined) updateData.startTime = startTime;
+    if (endTime !== undefined) updateData.endTime = endTime;
+    if (isActive !== undefined) updateData.isActive = isActive;
+    updateData.updatedAt = new Date();
+
+    const result = await db.collection("DoctorSchedule").updateOne(
+      { _id: new ObjectId(req.params.scheduleId) },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Schedule not found." });
+    }
+
+    res.status(200).json({ success: true, message: "Schedule updated." });
+  } catch (error) {
+    console.error("Update failed:", error);
+    res.status(500).json({ success: false, message: "Failed to update schedule." });
+  }
+});
+
+
+// =========================================================================
+// DELETE: SCHEDULE
+// =========================================================================
+router.delete("/schedule/:scheduleId", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+
+    const result = await db.collection("DoctorSchedule").deleteOne({
+      _id: new ObjectId(req.params.scheduleId)
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Schedule not found." });
+    }
+
+    res.status(200).json({ success: true, message: "Schedule deleted." });
+  } catch (error) {
+    console.error("Delete failed:", error);
+    res.status(500).json({ success: false, message: "Failed to delete schedule." });
   }
 });
 

@@ -35,6 +35,8 @@ connectToDatabase()
     const userRoutes = require("./routes/users");
     app.use("/api/users", userRoutes);
 
+       app.use("/api/patients",     patientRoutes);  
+
     app.listen(PORT, () => {
       console.log(`Backend server online at http://localhost:${PORT}`);
     });

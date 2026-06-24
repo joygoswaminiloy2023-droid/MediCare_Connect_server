@@ -178,7 +178,8 @@ router.post("/confirm/:appointmentId", async (req, res) => {
           appointmentStatus: "confirmed",
           paymentStatus:     "paid",
           stripeSessionId:   session.id,
-          confirmedAt:       now
+          confirmedAt:       now,
+          amount:            session.amount_total / 100
         }
       }
     );
@@ -209,7 +210,6 @@ router.post("/confirm/:appointmentId", async (req, res) => {
     res.status(500).json({ success: false, message: "Failed to confirm appointment." });
   }
 });
-
 // =========================================================================
 // GET: Appointment status by ID
 // =========================================================================
@@ -223,6 +223,30 @@ router.get("/status/:appointmentId", async (req, res) => {
     res.status(200).json({ success: true, appointment });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to fetch appointment." });
+  }
+});
+
+// =========================================================================
+// GET: Check appointment status (for polling)
+// =========================================================================
+router.get("/check/:appointmentId", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const appointment = await db.collection("Appointments").findOne({
+      _id: new ObjectId(req.params.appointmentId)
+    });
+
+    if (!appointment) {
+      return res.status(404).json({ success: false, message: "Not found." });
+    }
+
+    res.status(200).json({ 
+      success: true, 
+      status: appointment.appointmentStatus,
+      appointment 
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to check status." });
   }
 });
 
@@ -261,6 +285,193 @@ router.get("/my-payments/:patientEmail", async (req, res) => {
     res.status(200).json({ success: true, payments });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to fetch payments." });
+  }
+});
+
+// =========================================================================
+// GET: DOCTOR'S PENDING APPOINTMENT REQUESTS
+// =========================================================================
+router.get("/pending/:doctorEmail", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const doctorEmail = req.params.doctorEmail.toLowerCase();
+
+    // Get doctor's ID first
+    const doctor = await db.collection("Doctor").findOne({ 
+      email: doctorEmail 
+    });
+
+    if (!doctor) {
+      return res.status(404).json({ success: false, message: "Doctor not found." });
+    }
+
+    // Get all pending appointments for this doctor
+    const pendingAppointments = await db.collection("Appointments")
+      .find({
+        doctorId: doctor._id,
+        appointmentStatus: "pending"
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({ success: true, appointments: pendingAppointments });
+  } catch (error) {
+    console.error("Failed to fetch pending appointments:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch pending appointments." });
+  }
+});
+
+// =========================================================================
+// PATCH: DOCTOR ACCEPTS APPOINTMENT REQUEST
+// =========================================================================
+router.patch("/request/:appointmentId/accept", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const appointmentId = req.params.appointmentId;
+
+    const result = await db.collection("Appointments").updateOne(
+      { _id: new ObjectId(appointmentId) },
+      {
+        $set: {
+          appointmentStatus: "confirmed",
+          acceptedAt: new Date()
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Appointment not found." });
+    }
+
+    const appointment = await db.collection("Appointments").findOne({
+      _id: new ObjectId(appointmentId)
+    });
+
+    res.status(200).json({ success: true, message: "Appointment accepted!", appointment });
+  } catch (error) {
+    console.error("Accept failed:", error);
+    res.status(500).json({ success: false, message: "Failed to accept appointment." });
+  }
+});
+
+
+// =========================================================================
+// ADD THIS ROUTE TO appointments.js
+// POST: REQUEST APPOINTMENT (saves as pending, no payment yet)
+// Blocks duplicate active requests from same patient to same doctor
+// =========================================================================
+router.post("/request", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const {
+      doctorId, doctorName,
+      patientId, patientEmail, patientName,
+      date, timeSlot, problem
+    } = req.body;
+
+    if (!doctorId || !patientEmail || !date || !timeSlot) {
+      return res.status(400).json({ success: false, message: "Missing required fields." });
+    }
+
+    const doctorOid    = new ObjectId(doctorId);
+    const patientOid   = patientId ? new ObjectId(patientId) : null;
+    const normalEmail  = patientEmail.toLowerCase();
+
+    // ✅ BLOCK DUPLICATE: check if already has pending/confirmed with this doctor
+    const existing = await db.collection("Appointments").findOne({
+      patientEmail:      normalEmail,
+      doctorId:          doctorOid,
+      appointmentStatus: { $in: ["pending", "confirmed"] }
+    });
+
+    if (existing) {
+      const statusMsg = existing.appointmentStatus === "pending"
+        ? "You already have a pending request with this doctor. Please wait for their response."
+        : "You already have a confirmed appointment with this doctor.";
+
+      return res.status(409).json({
+        success:     false,
+        isDuplicate: true,
+        status:      existing.appointmentStatus,
+        message:     statusMsg
+      });
+    }
+
+    // Save appointment as pending (no payment yet)
+    const result = await db.collection("Appointments").insertOne({
+      patientId:         patientOid,
+      patientEmail:      normalEmail,
+      patientName,
+      doctorId:          doctorOid,
+      doctorName,
+      appointmentDate:   date,
+      appointmentTime:   timeSlot,
+      appointmentStatus: "pending",
+      symptoms:          problem || "General consultation",
+      paymentStatus:     "unpaid",
+      createdAt:         new Date()
+    });
+
+    res.status(200).json({
+      success:       true,
+      appointmentId: result.insertedId.toString(),
+      message:       "Appointment request sent to doctor."
+    });
+
+  } catch (error) {
+    console.error("Request appointment failed:", error);
+    res.status(500).json({ success: false, message: "Failed to send request.", error: error.message });
+  }
+});
+
+// =========================================================================
+// GET: CHECK APPOINTMENT STATUS (for polling on booking page)
+// =========================================================================
+router.get("/check/:appointmentId", async (req, res) => {
+  try {
+    const db          = await connectToDatabase();
+    const appointment = await db.collection("Appointments").findOne({
+      _id: new ObjectId(req.params.appointmentId)
+    });
+    if (!appointment) return res.status(404).json({ success: false });
+    res.status(200).json({
+      success:     true,
+      status:      appointment.appointmentStatus,
+      appointment
+    });
+  } catch (error) {
+    res.status(500).json({ success: false });
+  }
+});
+
+// =========================================================================
+// PATCH: DOCTOR REJECTS APPOINTMENT REQUEST
+// =========================================================================
+router.patch("/request/:appointmentId/reject", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const appointmentId = req.params.appointmentId;
+    const { reason } = req.body;
+
+    const result = await db.collection("Appointments").updateOne(
+      { _id: new ObjectId(appointmentId) },
+      {
+        $set: {
+          appointmentStatus: "rejected",
+          rejectionReason: reason || "Doctor rejected the request",
+          rejectedAt: new Date()
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Appointment not found." });
+    }
+
+    res.status(200).json({ success: true, message: "Appointment rejected." });
+  } catch (error) {
+    console.error("Reject failed:", error);
+    res.status(500).json({ success: false, message: "Failed to reject appointment." });
   }
 });
 

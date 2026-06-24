@@ -3,13 +3,13 @@ const router = express.Router();
 const { connectToDatabase } = require("../lib/db");
 const { ObjectId } = require("mongodb");
 
-// =========================================================================
+// 
 // ✅ PUT SPECIFIC ROUTES FIRST (before generic /:appointmentId)
-// =========================================================================
+// 
 
-// =========================================================================
+// 
 // GET: PATIENT'S UPCOMING APPOINTMENTS
-// =========================================================================
+// 
 router.get("/upcoming/:patientEmail", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -30,9 +30,9 @@ router.get("/upcoming/:patientEmail", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // GET: PATIENT'S APPOINTMENT HISTORY
-// =========================================================================
+// 
 router.get("/history/:patientEmail", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -48,9 +48,9 @@ router.get("/history/:patientEmail", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // GET: PAYMENT HISTORY
-// =========================================================================
+// 
 router.get("/payments/:patientEmail", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -83,9 +83,9 @@ router.get("/payments/:patientEmail", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // GET: PATIENT'S FAVORITE DOCTORS
-// =========================================================================
+// 
 router.get("/favorite-doctors/:patientEmail", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -128,9 +128,9 @@ router.get("/favorite-doctors/:patientEmail", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // POST: ADD REVIEW
-// =========================================================================
+// 
 router.post("/reviews", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -167,9 +167,9 @@ router.post("/reviews", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // GET: PATIENT'S REVIEWS
-// =========================================================================
+// 
 router.get("/reviews/:patientEmail", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -185,9 +185,9 @@ router.get("/reviews/:patientEmail", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // PATCH: UPDATE REVIEW
-// =========================================================================
+// 
 router.patch("/reviews/:reviewId", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -214,9 +214,9 @@ router.patch("/reviews/:reviewId", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // DELETE: DELETE REVIEW
-// =========================================================================
+// 
 router.delete("/reviews/:reviewId", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -231,13 +231,42 @@ router.delete("/reviews/:reviewId", async (req, res) => {
   }
 });
 
+// 
 // =========================================================================
-// ✅ GENERIC ROUTES COME LAST
+// ADD THIS ROUTE TO patient.js — BEFORE the generic /:appointmentId route
+// POST: CHECK IF PATIENT ALREADY HAS ACTIVE APPOINTMENT WITH THIS DOCTOR
 // =========================================================================
 
-// =========================================================================
+// GET: Check if patient already has pending/confirmed appointment with doctor
+router.get("/check-duplicate/:patientEmail/:doctorId", async (req, res) => {
+  try {
+    const db          = await connectToDatabase();
+    const email       = req.params.patientEmail.toLowerCase();
+    const doctorOid   = new ObjectId(req.params.doctorId);
+
+    const existing = await db.collection("Appointments").findOne({
+      patientEmail:      email,
+      doctorId:          doctorOid,
+      appointmentStatus: { $in: ["pending", "confirmed"] }
+    });
+
+    if (existing) {
+      return res.status(200).json({
+        success:     true,
+        isDuplicate: true,
+        status:      existing.appointmentStatus,
+        appointment: existing
+      });
+    }
+
+    res.status(200).json({ success: true, isDuplicate: false });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to check." });
+  }
+});
+// 
 // GET: SINGLE APPOINTMENT BY ID
-// =========================================================================
+// 
 router.get("/:appointmentId", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -251,9 +280,9 @@ router.get("/:appointmentId", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // PATCH: RESCHEDULE APPOINTMENT
-// =========================================================================
+// 
 router.patch("/:appointmentId/reschedule", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -280,9 +309,9 @@ router.patch("/:appointmentId/reschedule", async (req, res) => {
   }
 });
 
-// =========================================================================
+// 
 // DELETE: CANCEL APPOINTMENT
-// =========================================================================
+// 
 router.delete("/:appointmentId/cancel", async (req, res) => {
   try {
     const db = await connectToDatabase();
