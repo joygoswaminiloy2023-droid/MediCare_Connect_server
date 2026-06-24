@@ -4,15 +4,22 @@ const { connectToDatabase } = require("../lib/db");
 const { ObjectId } = require("mongodb");
 
 
-// GET: ALL APPROVED DOCTORS with search & filter
-
+// =========================================================================
+// GET: ALL APPROVED DOCTORS with search & filter (rating/reviews are now
+// computed live from the "Reviews" collection via $lookup, instead of
+// reading a non-existent "rating" field stored on the Doctor document).
+// =========================================================================
 router.get("/", async (req, res) => {
   try {
     const db = await connectToDatabase();
-    const { search = "", specialization = "", minRating = 0, maxFee = 100000, sortBy = "default", page = 1, limit = 9 } = req.query;
-    const query = {};
+    const {
+      search = "", specialization = "", minRating = 0, maxFee = 100000,
+      sortBy = "default", page = 1, limit = 9
+    } = req.query;
+
+    const match = {};
     if (search.trim()) {
-      query.$or = [
+      match.$or = [
         { doctorName:     { $regex: search.trim(), $options: "i" } },
         { name:           { $regex: search.trim(), $options: "i" } },
         { specialization: { $regex: search.trim(), $options: "i" } },
@@ -20,27 +27,90 @@ router.get("/", async (req, res) => {
       ];
     }
     if (specialization && specialization !== "All Types")
-      query.specialization = { $regex: specialization.trim(), $options: "i" };
-    if (Number(minRating) > 0) query.rating = { $gte: Number(minRating) };
-    if (Number(maxFee) < 100000) query.consultationFee = { $lte: Number(maxFee) };
+      match.specialization = { $regex: specialization.trim(), $options: "i" };
+    if (Number(maxFee) < 100000) match.consultationFee = { $lte: Number(maxFee) };
 
     let sort = {};
     switch (sortBy) {
-      case "fee_asc":  sort = { consultationFee: 1  }; break;
-      case "fee_desc": sort = { consultationFee: -1 }; break;
-      case "exp_desc": sort = { experience: -1 };      break;
-      case "name_asc": sort = { doctorName: 1 };       break;
-      default:         sort = { createdAt: -1 };
+      case "fee_asc":     sort = { consultationFee: 1  }; break;
+      case "fee_desc":    sort = { consultationFee: -1 }; break;
+      case "exp_desc":    sort = { experience: -1 };      break;
+      case "name_asc":    sort = { doctorName: 1 };       break;
+      case "rating_desc": sort = { rating: -1 };          break;
+      default:            sort = { createdAt: -1 };
     }
-    const pageNum  = Math.max(1, Number(page));
-    const limitNum = Math.min(50, Math.max(1, Number(limit)));
-    const skip     = (pageNum - 1) * limitNum;
-    const [doctors, total] = await Promise.all([
-      db.collection("Doctor").find(query).sort(sort).skip(skip).limit(limitNum).toArray(),
-      db.collection("Doctor").countDocuments(query)
-    ]);
-    res.status(200).json({ success: true, doctors, total, page: pageNum, totalPages: Math.ceil(total / limitNum), limit: limitNum });
+
+    const pageNum      = Math.max(1, Number(page));
+    const limitNum     = Math.min(50, Math.max(1, Number(limit)));
+    const skip         = (pageNum - 1) * limitNum;
+    const minRatingNum = Number(minRating) || 0;
+
+    const pipeline = [
+      { $match: match },
+
+      // Pull in this doctor's reviews from the "Reviews" collection
+      {
+        $lookup: {
+          from: "Reviews",
+          localField: "_id",
+          foreignField: "doctorId",
+          as: "reviewDocs"
+        }
+      },
+
+      // Compute live rating average + review count.
+      // Doctors with zero reviews default to a rating of 4 — this MUST match
+      // the 4.00 placeholder shown on the frontend, otherwise unrated doctors
+      // would visually show 4.00 but still get excluded by the minRating
+      // match below (null never satisfies a $gte comparison).
+      {
+        $addFields: {
+          reviews: { $size: "$reviewDocs" },
+          rating: {
+            $cond: [
+              { $gt: [{ $size: "$reviewDocs" }, 0] },
+              { $round: [{ $avg: "$reviewDocs.rating" }, 1] },
+              4
+            ]
+          }
+        }
+      },
+
+      // Drop the raw review documents, we only needed them for the calc above
+      { $project: { reviewDocs: 0 } }
+    ];
+
+    // Only doctors meeting the minimum rating survive this filter.
+    // Unrated doctors default to rating 4 above, so they correctly pass
+    // "Any Rating" / "3.5 & above" / "4.0 & above", but not "4.5 & above".
+    if (minRatingNum > 0) {
+      pipeline.push({ $match: { rating: { $gte: minRatingNum } } });
+    }
+
+    pipeline.push(
+      { $sort: sort },
+      {
+        $facet: {
+          data: [{ $skip: skip }, { $limit: limitNum }],
+          totalCount: [{ $count: "count" }]
+        }
+      }
+    );
+
+    const result   = await db.collection("Doctor").aggregate(pipeline).toArray();
+    const doctors  = result[0]?.data || [];
+    const total    = result[0]?.totalCount[0]?.count || 0;
+
+    res.status(200).json({
+      success: true,
+      doctors,
+      total,
+      page: pageNum,
+      totalPages: Math.ceil(total / limitNum),
+      limit: limitNum
+    });
   } catch (error) {
+    console.error("Doctor list fetch failed:", error);
     res.status(500).json({ success: false, message: "Failed to load doctors." });
   }
 });
@@ -407,6 +477,114 @@ router.delete("/schedule/:scheduleId", async (req, res) => {
   } catch (error) {
     console.error("Delete failed:", error);
     res.status(500).json({ success: false, message: "Failed to delete schedule." });
+  }
+});
+
+
+// =========================================================================
+// GET: FEATURED REVIEWS ACROSS ALL DOCTORS (for homepage testimonials)
+// IMPORTANT: this route is registered BEFORE "/reviews/:doctorId" below —
+// if it came after, Express would match "/reviews/featured" against the
+// dynamic route instead and try (and fail) to cast "featured" to an ObjectId.
+// =========================================================================
+router.get("/reviews/featured", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const limitNum     = Math.min(20, Math.max(1, Number(req.query.limit) || 6));
+    const minRatingNum = Number(req.query.minRating) || 4; // only surface solid reviews by default
+
+    const reviews = await db.collection("Reviews").aggregate([
+      {
+        $match: {
+          rating: { $gte: minRatingNum },
+          reviewText: { $exists: true, $ne: "" }
+        }
+      },
+      { $sort: { rating: -1, createdAt: -1 } },
+      { $limit: limitNum },
+
+      // Pull in the doctor this review was about
+      {
+        $lookup: {
+          from: "Doctor",
+          localField: "doctorId",
+          foreignField: "_id",
+          as: "doctorInfo"
+        }
+      },
+
+      // Reviews only stores patientEmail, not a display name. The
+      // appointment captured at booking time is the most likely place
+      // a real patient name would have been recorded, so try that first.
+      {
+        $lookup: {
+          from: "Appointments",
+          localField: "appointmentId",
+          foreignField: "_id",
+          as: "appointmentInfo"
+        }
+      },
+
+      {
+        $addFields: {
+          doctorInfo:      { $arrayElemAt: ["$doctorInfo", 0] },
+          appointmentInfo: { $arrayElemAt: ["$appointmentInfo", 0] }
+        }
+      },
+
+      {
+        $project: {
+          _id: 1,
+          rating: 1,
+          reviewText: 1,
+          createdAt: 1,
+          patientEmail: 1,
+          // null if the Appointments schema doesn't actually have these
+          // fields — the frontend falls back to deriving a name from the email
+          patientName: {
+            $ifNull: ["$appointmentInfo.patientName", "$appointmentInfo.name"]
+          },
+          doctorName:     "$doctorInfo.doctorName",
+          specialization: "$doctorInfo.specialization"
+        }
+      }
+    ]).toArray();
+
+    res.status(200).json({ success: true, reviews });
+  } catch (error) {
+    console.error("Failed to fetch featured reviews:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch featured reviews." });
+  }
+});
+
+
+// =========================================================================
+// GET: DOCTOR'S REVIEWS (for cards display / doctor profile page)
+// =========================================================================
+router.get("/reviews/:doctorId", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const doctorId = new ObjectId(req.params.doctorId);
+
+    const reviews = await db.collection("Reviews")
+      .find({ doctorId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // Calculate average rating
+    const avgRating = reviews.length > 0
+      ? (reviews.reduce((sum, r) => sum + (Number(r.rating) || 0), 0) / reviews.length).toFixed(1)
+      : 0;
+
+    res.status(200).json({
+      success: true,
+      reviews,
+      averageRating: parseFloat(avgRating),
+      reviewCount: reviews.length
+    });
+  } catch (error) {
+    console.error("Failed to fetch reviews:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch reviews." });
   }
 });
 
