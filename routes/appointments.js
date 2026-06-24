@@ -355,11 +355,8 @@ router.patch("/request/:appointmentId/accept", async (req, res) => {
 });
 
 
-// =========================================================================
-// ADD THIS ROUTE TO appointments.js
-// POST: REQUEST APPOINTMENT (saves as pending, no payment yet)
-// Blocks duplicate active requests from same patient to same doctor
-// =========================================================================
+// POST: REQUEST APPOINTMENT (before payment)
+
 router.post("/request", async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -373,54 +370,69 @@ router.post("/request", async (req, res) => {
       return res.status(400).json({ success: false, message: "Missing required fields." });
     }
 
-    const doctorOid    = new ObjectId(doctorId);
-    const patientOid   = patientId ? new ObjectId(patientId) : null;
-    const normalEmail  = patientEmail.toLowerCase();
+    const normalizedEmail = patientEmail.toLowerCase();
 
-    // ✅ BLOCK DUPLICATE: check if already has pending/confirmed with this doctor
-    const existing = await db.collection("Appointments").findOne({
-      patientEmail:      normalEmail,
-      doctorId:          doctorOid,
-      appointmentStatus: { $in: ["pending", "confirmed"] }
+   
+    const restriction = await db.collection("UserRestrictions").findOne({
+      email: normalizedEmail
     });
 
-    if (existing) {
-      const statusMsg = existing.appointmentStatus === "pending"
-        ? "You already have a pending request with this doctor. Please wait for their response."
-        : "You already have a confirmed appointment with this doctor.";
+    if (restriction) {
+      const now = new Date();
+      const restrictionUntil = new Date(restriction.until);
 
-      return res.status(409).json({
-        success:     false,
-        isDuplicate: true,
-        status:      existing.appointmentStatus,
-        message:     statusMsg
-      });
+      if (now <= restrictionUntil) {
+        // Still restricted
+        if (restriction.status === "banned") {
+          return res.status(403).json({ 
+            success: false, 
+            message: "Your account is banned. You cannot book appointments.",
+            status: "banned"
+          });
+        } else {
+          return res.status(403).json({ 
+            success: false, 
+            message: `You are restricted from booking until ${new Date(restriction.until).toLocaleDateString()}. Reason: ${restriction.reason}`,
+            status: "restricted",
+            until: restriction.until
+          });
+        }
+      } else {
+        // Restriction expired, remove it
+        await db.collection("UserRestrictions").deleteOne({ email: normalizedEmail });
+      }
     }
 
-    // Save appointment as pending (no payment yet)
-    const result = await db.collection("Appointments").insertOne({
-      patientId:         patientOid,
-      patientEmail:      normalEmail,
-      patientName,
-      doctorId:          doctorOid,
-      doctorName,
-      appointmentDate:   date,
-      appointmentTime:   timeSlot,
-      appointmentStatus: "pending",
-      symptoms:          problem || "General consultation",
-      paymentStatus:     "unpaid",
-      createdAt:         new Date()
-    });
+    const doctorOid = new ObjectId(doctorId);
+    const patientOid = patientId ? new ObjectId(patientId) : null;
+    const now = new Date();
 
-    res.status(200).json({
-      success:       true,
-      appointmentId: result.insertedId.toString(),
-      message:       "Appointment request sent to doctor."
+    // Save appointment as PENDING (waiting for doctor approval)
+    const appointmentDoc = {
+      patientId: patientOid,
+      patientEmail: normalizedEmail,
+      patientName,
+      doctorId: doctorOid,
+      doctorName,
+      appointmentDate: date,
+      appointmentTime: timeSlot,
+      appointmentStatus: "pending",
+      symptoms: problem || "General consultation",
+      paymentStatus: "unpaid",
+      createdAt: now
+    };
+
+    const result = await db.collection("Appointments").insertOne(appointmentDoc);
+
+    res.status(201).json({ 
+      success: true, 
+      message: "Appointment request sent to doctor!",
+      appointmentId: result.insertedId 
     });
 
   } catch (error) {
     console.error("Request appointment failed:", error);
-    res.status(500).json({ success: false, message: "Failed to send request.", error: error.message });
+    res.status(500).json({ success: false, message: "Failed to request appointment." });
   }
 });
 
@@ -472,6 +484,47 @@ router.patch("/request/:appointmentId/reject", async (req, res) => {
   } catch (error) {
     console.error("Reject failed:", error);
     res.status(500).json({ success: false, message: "Failed to reject appointment." });
+  }
+});
+
+
+// =========================================================================
+// GET: CHECK USER BOOKING RESTRICTION
+// =========================================================================
+router.get("/check-restriction/:email", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const userEmail = decodeURIComponent(req.params.email).toLowerCase();
+
+    // Check if user has a restriction
+    const restriction = await db.collection("UserRestrictions").findOne({
+      email: userEmail
+    });
+
+    if (!restriction) {
+      return res.status(200).json({ success: true, status: "active" });
+    }
+
+    // Check if restriction is still active
+    const now = new Date();
+    const restrictionUntil = new Date(restriction.until);
+
+    if (now > restrictionUntil) {
+      // Restriction expired, remove it
+      await db.collection("UserRestrictions").deleteOne({ email: userEmail });
+      return res.status(200).json({ success: true, status: "active" });
+    }
+
+    // Restriction is still active
+    res.status(200).json({
+      success: true,
+      status: restriction.status || "restricted", // "restricted" or "banned"
+      until: restriction.until,
+      reason: restriction.reason
+    });
+  } catch (error) {
+    console.error("Restriction check failed:", error);
+    res.status(500).json({ success: false, message: "Failed to check restriction." });
   }
 });
 
