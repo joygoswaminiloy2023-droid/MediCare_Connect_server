@@ -23,6 +23,55 @@ router.get("/doctor/:id", async (req, res) => {
 });
 
 // =========================================================================
+// POST: REQUEST APPOINTMENT (before payment)
+// =========================================================================
+router.post("/request", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const {
+      doctorId, doctorName,
+      patientId, patientEmail, patientName,
+      date, timeSlot, problem
+    } = req.body;
+
+    if (!doctorId || !patientEmail || !date || !timeSlot) {
+      return res.status(400).json({ success: false, message: "Missing required fields." });
+    }
+
+    const doctorOid = new ObjectId(doctorId);
+    const patientOid = patientId ? new ObjectId(patientId) : null;
+    const now = new Date();
+
+    // Save appointment as PENDING (waiting for doctor approval)
+    const appointmentDoc = {
+      patientId: patientOid,
+      patientEmail: patientEmail.toLowerCase(),
+      patientName,
+      doctorId: doctorOid,
+      doctorName,
+      appointmentDate: date,
+      appointmentTime: timeSlot,
+      appointmentStatus: "pending",
+      symptoms: problem || "General consultation",
+      paymentStatus: "unpaid",
+      createdAt: now
+    };
+
+    const result = await db.collection("Appointments").insertOne(appointmentDoc);
+
+    res.status(201).json({ 
+      success: true, 
+      message: "Appointment request sent to doctor!",
+      appointmentId: result.insertedId 
+    });
+
+  } catch (error) {
+    console.error("Request appointment failed:", error);
+    res.status(500).json({ success: false, message: "Failed to request appointment." });
+  }
+});
+
+// =========================================================================
 // POST: Create Stripe checkout session + save pending appointment
 // =========================================================================
 router.post("/create-checkout", async (req, res) => {
@@ -90,7 +139,6 @@ router.post("/create-checkout", async (req, res) => {
         quantity: 1,
       }],
       metadata: { appointmentId, doctorId, patientEmail },
-      // ✅ Pass appointmentId in success URL so we can confirm on return
       success_url: `${CLIENT_URL}/appointments/success?appointmentId=${appointmentId}&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url:  `${CLIENT_URL}/appointments/book/${doctorId}?cancelled=true`,
     });
@@ -106,7 +154,6 @@ router.post("/create-checkout", async (req, res) => {
 // =========================================================================
 // POST: Confirm appointment after Stripe redirects back
 // Called from success page — verifies payment with Stripe directly
-// No webhook needed!
 // =========================================================================
 router.post("/confirm/:appointmentId", async (req, res) => {
   try {

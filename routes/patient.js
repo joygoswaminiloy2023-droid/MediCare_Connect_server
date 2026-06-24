@@ -4,6 +4,10 @@ const { connectToDatabase } = require("../lib/db");
 const { ObjectId } = require("mongodb");
 
 // =========================================================================
+// ✅ PUT SPECIFIC ROUTES FIRST (before generic /:appointmentId)
+// =========================================================================
+
+// =========================================================================
 // GET: PATIENT'S UPCOMING APPOINTMENTS
 // =========================================================================
 router.get("/upcoming/:patientEmail", async (req, res) => {
@@ -27,7 +31,7 @@ router.get("/upcoming/:patientEmail", async (req, res) => {
 });
 
 // =========================================================================
-// GET: PATIENT'S APPOINTMENT HISTORY (past + all statuses)
+// GET: PATIENT'S APPOINTMENT HISTORY
 // =========================================================================
 router.get("/history/:patientEmail", async (req, res) => {
   try {
@@ -45,103 +49,23 @@ router.get("/history/:patientEmail", async (req, res) => {
 });
 
 // =========================================================================
-// GET: SINGLE APPOINTMENT BY ID
-// =========================================================================
-router.get("/:appointmentId", async (req, res) => {
-  try {
-    const db = await connectToDatabase();
-    const appointment = await db.collection("Appointments").findOne({
-      _id: new ObjectId(req.params.appointmentId)
-    });
-    if (!appointment) return res.status(404).json({ success: false, message: "Appointment not found." });
-    res.status(200).json({ success: true, appointment });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Failed to fetch appointment." });
-  }
-});
-
-// =========================================================================
-// PATCH: RESCHEDULE APPOINTMENT
-// =========================================================================
-router.patch("/:appointmentId/reschedule", async (req, res) => {
-  try {
-    const db = await connectToDatabase();
-    const { newDate, newTime } = req.body;
-    
-    if (!newDate || !newTime) {
-      return res.status(400).json({ success: false, message: "New date and time are required." });
-    }
-    
-    await db.collection("Appointments").updateOne(
-      { _id: new ObjectId(req.params.appointmentId) },
-      {
-        $set: {
-          appointmentDate: newDate,
-          appointmentTime: newTime,
-          updatedAt: new Date()
-        }
-      }
-    );
-    
-    res.status(200).json({ success: true, message: "Appointment rescheduled successfully." });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Failed to reschedule appointment." });
-  }
-});
-
-// =========================================================================
-// DELETE: CANCEL APPOINTMENT
-// =========================================================================
-router.delete("/:appointmentId/cancel", async (req, res) => {
-  try {
-    const db = await connectToDatabase();
-    
-    const appointment = await db.collection("Appointments").findOne({
-      _id: new ObjectId(req.params.appointmentId)
-    });
-    
-    if (!appointment) {
-      return res.status(404).json({ success: false, message: "Appointment not found." });
-    }
-    
-    // Mark as cancelled instead of deleting
-    await db.collection("Appointments").updateOne(
-      { _id: new ObjectId(req.params.appointmentId) },
-      {
-        $set: {
-          appointmentStatus: "cancelled",
-          cancelledAt: new Date()
-        }
-      }
-    );
-    
-    res.status(200).json({ success: true, message: "Appointment cancelled successfully." });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Failed to cancel appointment." });
-  }
-});
-
-// =========================================================================
 // GET: PAYMENT HISTORY
 // =========================================================================
 router.get("/payments/:patientEmail", async (req, res) => {
   try {
     const db = await connectToDatabase();
     
-    // Get all appointments for this patient
     const appointments = await db.collection("Appointments")
       .find({ patientEmail: req.params.patientEmail.toLowerCase() })
       .toArray();
     
     const appointmentIds = appointments.map(a => a._id);
     
-    // Get payments for these appointments
     const payments = await db.collection("Payments")
       .find({ appointmentId: { $in: appointmentIds } })
       .sort({ createdAt: -1 })
       .toArray();
     
-    // Enrich with appointment details
     const enrichedPayments = payments.map(payment => {
       const apt = appointments.find(a => a._id.toString() === payment.appointmentId.toString());
       return {
@@ -160,6 +84,51 @@ router.get("/payments/:patientEmail", async (req, res) => {
 });
 
 // =========================================================================
+// GET: PATIENT'S FAVORITE DOCTORS
+// =========================================================================
+router.get("/favorite-doctors/:patientEmail", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    
+    const appointments = await db.collection("Appointments")
+      .find({ patientEmail: req.params.patientEmail.toLowerCase() })
+      .toArray();
+    
+    const doctorIds = [...new Set(appointments.map(a => a.doctorId))];
+    
+    if (doctorIds.length === 0) {
+      return res.status(200).json({ success: true, doctors: [] });
+    }
+    
+    const doctors = await db.collection("Doctor")
+      .find({ _id: { $in: doctorIds } })
+      .toArray();
+    
+    const doctorsWithRatings = await Promise.all(
+      doctors.map(async (doc) => {
+        const reviews = await db.collection("Reviews")
+          .find({ doctorId: doc._id })
+          .toArray();
+        
+        const avgRating = reviews.length > 0
+          ? (reviews.reduce((sum, r) => sum + Number(r.rating), 0) / reviews.length).toFixed(1)
+          : 0;
+        
+        const appointmentCount = appointments.filter(a => a.doctorId.toString() === doc._id.toString()).length;
+        
+        return { ...doc, avgRating: Number(avgRating), reviewCount: reviews.length, appointmentCount };
+      })
+    );
+    
+    doctorsWithRatings.sort((a, b) => b.appointmentCount - a.appointmentCount);
+    
+    res.status(200).json({ success: true, doctors: doctorsWithRatings.slice(0, 5) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to fetch favorite doctors." });
+  }
+});
+
+// =========================================================================
 // POST: ADD REVIEW
 // =========================================================================
 router.post("/reviews", async (req, res) => {
@@ -171,7 +140,6 @@ router.post("/reviews", async (req, res) => {
       return res.status(400).json({ success: false, message: "Doctor, rating, and review text are required." });
     }
     
-    // Check if review already exists
     const existing = await db.collection("Reviews").findOne({
       doctorId: new ObjectId(doctorId),
       patientId: patientId ? new ObjectId(patientId) : null,
@@ -264,50 +232,82 @@ router.delete("/reviews/:reviewId", async (req, res) => {
 });
 
 // =========================================================================
-// GET: PATIENT'S FAVORITE DOCTORS (most reviewed / highest rated)
+// ✅ GENERIC ROUTES COME LAST
 // =========================================================================
-router.get("/favorite-doctors/:patientEmail", async (req, res) => {
+
+// =========================================================================
+// GET: SINGLE APPOINTMENT BY ID
+// =========================================================================
+router.get("/:appointmentId", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const appointment = await db.collection("Appointments").findOne({
+      _id: new ObjectId(req.params.appointmentId)
+    });
+    if (!appointment) return res.status(404).json({ success: false, message: "Appointment not found." });
+    res.status(200).json({ success: true, appointment });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to fetch appointment." });
+  }
+});
+
+// =========================================================================
+// PATCH: RESCHEDULE APPOINTMENT
+// =========================================================================
+router.patch("/:appointmentId/reschedule", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const { newDate, newTime } = req.body;
+    
+    if (!newDate || !newTime) {
+      return res.status(400).json({ success: false, message: "New date and time are required." });
+    }
+    
+    await db.collection("Appointments").updateOne(
+      { _id: new ObjectId(req.params.appointmentId) },
+      {
+        $set: {
+          appointmentDate: newDate,
+          appointmentTime: newTime,
+          updatedAt: new Date()
+        }
+      }
+    );
+    
+    res.status(200).json({ success: true, message: "Appointment rescheduled successfully." });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to reschedule appointment." });
+  }
+});
+
+// =========================================================================
+// DELETE: CANCEL APPOINTMENT
+// =========================================================================
+router.delete("/:appointmentId/cancel", async (req, res) => {
   try {
     const db = await connectToDatabase();
     
-    const appointments = await db.collection("Appointments")
-      .find({ patientEmail: req.params.patientEmail.toLowerCase() })
-      .toArray();
+    const appointment = await db.collection("Appointments").findOne({
+      _id: new ObjectId(req.params.appointmentId)
+    });
     
-    const doctorIds = [...new Set(appointments.map(a => a.doctorId))];
-    
-    if (doctorIds.length === 0) {
-      return res.status(200).json({ success: true, doctors: [] });
+    if (!appointment) {
+      return res.status(404).json({ success: false, message: "Appointment not found." });
     }
     
-    // Get doctor details with ratings
-    const doctors = await db.collection("Doctor")
-      .find({ _id: { $in: doctorIds } })
-      .toArray();
-    
-    // Get rating for each doctor
-    const doctorsWithRatings = await Promise.all(
-      doctors.map(async (doc) => {
-        const reviews = await db.collection("Reviews")
-          .find({ doctorId: doc._id })
-          .toArray();
-        
-        const avgRating = reviews.length > 0
-          ? (reviews.reduce((sum, r) => sum + Number(r.rating), 0) / reviews.length).toFixed(1)
-          : 0;
-        
-        const appointmentCount = appointments.filter(a => a.doctorId.toString() === doc._id.toString()).length;
-        
-        return { ...doc, avgRating: Number(avgRating), reviewCount: reviews.length, appointmentCount };
-      })
+    await db.collection("Appointments").updateOne(
+      { _id: new ObjectId(req.params.appointmentId) },
+      {
+        $set: {
+          appointmentStatus: "cancelled",
+          cancelledAt: new Date()
+        }
+      }
     );
     
-    // Sort by appointment count (most visited)
-    doctorsWithRatings.sort((a, b) => b.appointmentCount - a.appointmentCount);
-    
-    res.status(200).json({ success: true, doctors: doctorsWithRatings.slice(0, 5) });
+    res.status(200).json({ success: true, message: "Appointment cancelled successfully." });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Failed to fetch favorite doctors." });
+    res.status(500).json({ success: false, message: "Failed to cancel appointment." });
   }
 });
 
