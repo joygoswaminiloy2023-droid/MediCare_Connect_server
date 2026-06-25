@@ -181,24 +181,6 @@ npm run dev
 
 ---
 
-## 🔑 Environment Variables
-
-Create a `.env` file:
-
-```env
-PORT=5000
-
-DB_USER=
-DB_PASS=
-
-JWT_SECRET=
-
-STRIPE_SECRET_KEY=
-
-FIREBASE_PROJECT_ID=
-FIREBASE_PRIVATE_KEY=
-FIREBASE_CLIENT_EMAIL=
-```
 
 ---
 
