@@ -23,7 +23,7 @@ router.get("/doctor/:id", async (req, res) => {
 });
 
 // =========================================================================
-// POST: REQUEST APPOINTMENT (before payment)
+// POST: REQUEST APPOINTMENT (before payment) - Creates ONE appointment
 // =========================================================================
 router.post("/request", async (req, res) => {
   try {
@@ -46,7 +46,6 @@ router.post("/request", async (req, res) => {
     });
 
     if (user) {
-      // Check if user is banned
       if (user.status === "banned") {
         return res.status(403).json({ 
           success: false, 
@@ -55,13 +54,11 @@ router.post("/request", async (req, res) => {
         });
       }
 
-      // Check if user is temporarily restricted
       if (user.status === "restricted" && user.restrictedUntil) {
         const now = new Date();
         const restrictionUntil = new Date(user.restrictedUntil);
 
         if (now <= restrictionUntil) {
-          // Still restricted
           return res.status(403).json({ 
             success: false, 
             message: `You are restricted from booking until ${restrictionUntil.toLocaleDateString()}.`,
@@ -69,7 +66,6 @@ router.post("/request", async (req, res) => {
             until: user.restrictedUntil
           });
         } else {
-          // Restriction expired - auto-restore the user
           await db.collection("user").updateOne(
             { email: normalizedEmail },
             { 
@@ -81,11 +77,28 @@ router.post("/request", async (req, res) => {
       }
     }
 
+    // ✅ CHECK FOR EXISTING PENDING APPOINTMENT (PREVENT DUPLICATES)
+    const existingAppointment = await db.collection("Appointments").findOne({
+      doctorId: new ObjectId(doctorId),
+      patientEmail: normalizedEmail,
+      appointmentDate: date,
+      appointmentTime: timeSlot,
+      appointmentStatus: { $in: ["pending", "confirmed"] }
+    });
+
+    if (existingAppointment) {
+      return res.status(409).json({ 
+        success: false, 
+        message: "You already have a pending appointment with this doctor at this time.",
+        appointmentId: existingAppointment._id
+      });
+    }
+
     const doctorOid = new ObjectId(doctorId);
     const patientOid = patientId ? new ObjectId(patientId) : null;
     const now = new Date();
 
-    // Save appointment as PENDING (waiting for doctor approval)
+    // ✅ CREATE ONE APPOINTMENT - PENDING
     const appointmentDoc = {
       patientId: patientOid,
       patientEmail: normalizedEmail,
@@ -97,7 +110,8 @@ router.post("/request", async (req, res) => {
       appointmentStatus: "pending",
       symptoms: problem || "General consultation",
       paymentStatus: "unpaid",
-      createdAt: now
+      createdAt: now,
+      updatedAt: now
     };
 
     const result = await db.collection("Appointments").insertOne(appointmentDoc);
@@ -115,82 +129,137 @@ router.post("/request", async (req, res) => {
 });
 
 // =========================================================================
-// POST: Create Stripe checkout session + save pending appointment
+// POST: Create Stripe checkout session - USES EXISTING APPOINTMENT
 // =========================================================================
 router.post("/create-checkout", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const {
-      doctorId, doctorName,
-      patientId, patientEmail, patientName,
-      date, timeSlot, problem, consultationFee
+      appointmentId, // ✅ REQUIRED - Use existing appointment
+      doctorId, 
+      doctorName,
+      patientId, 
+      patientEmail, 
+      patientName,
+      date, 
+      timeSlot, 
+      problem, 
+      consultationFee
     } = req.body;
+
+    // ✅ MUST have appointmentId
+    if (!appointmentId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Appointment ID is required. Please request an appointment first." 
+      });
+    }
 
     if (!doctorId || !patientEmail || !date || !timeSlot) {
       return res.status(400).json({ success: false, message: "Missing required fields." });
     }
 
-    const doctorOid  = new ObjectId(doctorId);
-    const patientOid = patientId ? new ObjectId(patientId) : null;
-    const fee        = Number(consultationFee) || 0;
-    const now        = new Date();
-
-    // Save appointment as pending
-    const appointmentDoc = {
-      patientId:         patientOid,
-      patientEmail:      patientEmail.toLowerCase(),
-      patientName,
-      doctorId:          doctorOid,
-      doctorName,
-      appointmentDate:   date,
-      appointmentTime:   timeSlot,
-      appointmentStatus: "pending",
-      symptoms:          problem || "General consultation",
-      paymentStatus:     "unpaid",
-      createdAt:         now
-    };
-
-    const apptResult    = await db.collection("Appointments").insertOne(appointmentDoc);
-    const appointmentId = apptResult.insertedId.toString();
-
-    // Save pending payment record
-    await db.collection("Payments").insertOne({
-      appointmentId:  apptResult.insertedId,
-      patientId:      patientOid,
-      doctorId:       doctorOid,
-      amount:         fee,
-      transactionId:  null,
-      paymentDate:    null,
-      paymentStatus:  "unpaid",
-      createdAt:      now
+    // ✅ FIND EXISTING APPOINTMENT
+    const appointment = await db.collection("Appointments").findOne({
+      _id: new ObjectId(appointmentId)
     });
 
-    // Create Stripe checkout session
+    if (!appointment) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Appointment not found." 
+      });
+    }
+
+    // ✅ Check if already paid
+    if (appointment.paymentStatus === "paid") {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Appointment already paid." 
+      });
+    }
+
+    // ✅ Check if appointment is confirmed by doctor
+    if (appointment.appointmentStatus !== "confirmed") {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Appointment must be confirmed by the doctor before payment." 
+      });
+    }
+
+    const fee = Number(consultationFee) || 0;
+    const doctorOid = new ObjectId(doctorId);
+    const patientOid = patientId ? new ObjectId(patientId) : null;
+
+    // ✅ UPDATE EXISTING APPOINTMENT - DO NOT CREATE NEW
+    await db.collection("Appointments").updateOne(
+      { _id: new ObjectId(appointmentId) },
+      { 
+        $set: { 
+          paymentStatus: "pending",
+          paymentInitiatedAt: new Date(),
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    // Check if payment record exists
+    const existingPayment = await db.collection("Payments").findOne({
+      appointmentId: new ObjectId(appointmentId)
+    });
+
+    if (!existingPayment) {
+      // Create payment record only if it doesn't exist
+      await db.collection("Payments").insertOne({
+        appointmentId: new ObjectId(appointmentId),
+        patientId: patientOid,
+        doctorId: doctorOid,
+        amount: fee,
+        transactionId: null,
+        paymentDate: null,
+        paymentStatus: "pending",
+        createdAt: new Date()
+      });
+    }
+
+    // ✅ Create Stripe checkout session
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
-      mode:                 "payment",
-      customer_email:       patientEmail,
+      mode: "payment",
+      customer_email: patientEmail,
       line_items: [{
         price_data: {
-          currency:     "usd",
+          currency: "usd",
           product_data: {
-            name:        `Consultation with ${doctorName}`,
+            name: `Consultation with ${doctorName}`,
             description: `${date} at ${timeSlot} — ${problem || "General consultation"}`,
           },
           unit_amount: Math.round(fee * 100),
         },
         quantity: 1,
       }],
-      metadata: { appointmentId, doctorId, patientEmail },
+      metadata: { 
+        appointmentId, 
+        doctorId, 
+        patientEmail 
+      },
       success_url: `${CLIENT_URL}/appointments/success?appointmentId=${appointmentId}&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `${CLIENT_URL}/appointments/book/${doctorId}?cancelled=true`,
+      cancel_url: `${CLIENT_URL}/appointments/book/${doctorId}?cancelled=true`,
     });
 
-    res.status(200).json({ success: true, url: session.url, appointmentId });
+    res.status(200).json({ 
+      success: true, 
+      url: session.url, 
+      appointmentId 
+    });
 
   } catch (error) {
     console.error("Checkout creation failed:", error);
-    res.status(500).json({ success: false, message: "Failed to create checkout.", error: error.message });
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to create checkout.", 
+      error: error.message 
+    });
   }
 });
 
@@ -199,7 +268,7 @@ router.post("/create-checkout", async (req, res) => {
 // =========================================================================
 router.post("/confirm/:appointmentId", async (req, res) => {
   try {
-    const db        = await connectToDatabase();
+    const db = await connectToDatabase();
     const { sessionId } = req.body;
     const appointmentId = req.params.appointmentId;
 
@@ -212,16 +281,17 @@ router.post("/confirm/:appointmentId", async (req, res) => {
 
     const now = new Date();
 
-    // Update Appointments
+    // ✅ UPDATE EXISTING APPOINTMENT - DO NOT CREATE NEW
     await db.collection("Appointments").updateOne(
       { _id: new ObjectId(appointmentId) },
       {
         $set: {
           appointmentStatus: "confirmed",
-          paymentStatus:     "paid",
-          stripeSessionId:   session.id,
-          confirmedAt:       now,
-          amount:            session.amount_total / 100
+          paymentStatus: "paid",
+          stripeSessionId: session.id,
+          confirmedAt: now,
+          amount: session.amount_total / 100,
+          updatedAt: now
         }
       }
     );
@@ -232,12 +302,13 @@ router.post("/confirm/:appointmentId", async (req, res) => {
       {
         $set: {
           transactionId: session.payment_intent,
-          paymentDate:   now,
+          paymentDate: now,
           paymentStatus: "paid",
-          amount:        session.amount_total / 100,
+          amount: session.amount_total / 100,
           stripeSessionId: session.id
         }
-      }
+      },
+      { upsert: true }
     );
 
     // Return confirmed appointment
@@ -294,7 +365,7 @@ router.get("/check/:appointmentId", async (req, res) => {
 });
 
 // =========================================================================
-// GET: Patient appointment history
+// GET: Patient appointment history (NO DUPLICATES)
 // =========================================================================
 router.get("/my-appointments/:patientEmail", async (req, res) => {
   try {
@@ -303,7 +374,20 @@ router.get("/my-appointments/:patientEmail", async (req, res) => {
       .find({ patientEmail: req.params.patientEmail.toLowerCase() })
       .sort({ createdAt: -1 })
       .toArray();
-    res.status(200).json({ success: true, appointments });
+    
+    // ✅ Remove duplicates based on unique combination
+    const uniqueAppointments = [];
+    const seen = new Set();
+    
+    for (const apt of appointments) {
+      const key = `${apt.doctorId}-${apt.appointmentDate}-${apt.appointmentTime}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueAppointments.push(apt);
+      }
+    }
+    
+    res.status(200).json({ success: true, appointments: uniqueAppointments });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to fetch appointments." });
   }
@@ -339,7 +423,6 @@ router.get("/pending/:doctorEmail", async (req, res) => {
     const db = await connectToDatabase();
     const doctorEmail = req.params.doctorEmail.toLowerCase();
 
-    // Get doctor's ID first
     const doctor = await db.collection("Doctor").findOne({ 
       email: doctorEmail 
     });
@@ -348,7 +431,6 @@ router.get("/pending/:doctorEmail", async (req, res) => {
       return res.status(404).json({ success: false, message: "Doctor not found." });
     }
 
-    // Get all pending appointments for this doctor
     const pendingAppointments = await db.collection("Appointments")
       .find({
         doctorId: doctor._id,
@@ -365,19 +447,38 @@ router.get("/pending/:doctorEmail", async (req, res) => {
 });
 
 // =========================================================================
-// PATCH: DOCTOR ACCEPTS APPOINTMENT REQUEST
+// PATCH: DOCTOR ACCEPTS APPOINTMENT REQUEST - UPDATES ONLY
 // =========================================================================
 router.patch("/request/:appointmentId/accept", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const appointmentId = req.params.appointmentId;
 
+    // ✅ Check if appointment exists
+    const existingAppointment = await db.collection("Appointments").findOne({
+      _id: new ObjectId(appointmentId)
+    });
+
+    if (!existingAppointment) {
+      return res.status(404).json({ success: false, message: "Appointment not found." });
+    }
+
+    // ✅ Only accept if pending
+    if (existingAppointment.appointmentStatus !== "pending") {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Cannot accept appointment with status: ${existingAppointment.appointmentStatus}` 
+      });
+    }
+
+    // ✅ UPDATE ONLY - DO NOT CREATE NEW
     const result = await db.collection("Appointments").updateOne(
       { _id: new ObjectId(appointmentId) },
       {
         $set: {
           appointmentStatus: "confirmed",
-          acceptedAt: new Date()
+          acceptedAt: new Date(),
+          updatedAt: new Date()
         }
       }
     );
@@ -398,7 +499,7 @@ router.patch("/request/:appointmentId/accept", async (req, res) => {
 });
 
 // =========================================================================
-// PATCH: DOCTOR REJECTS APPOINTMENT REQUEST
+// PATCH: DOCTOR REJECTS APPOINTMENT REQUEST - UPDATES ONLY
 // =========================================================================
 router.patch("/request/:appointmentId/reject", async (req, res) => {
   try {
@@ -406,13 +507,29 @@ router.patch("/request/:appointmentId/reject", async (req, res) => {
     const appointmentId = req.params.appointmentId;
     const { reason } = req.body;
 
+    const existingAppointment = await db.collection("Appointments").findOne({
+      _id: new ObjectId(appointmentId)
+    });
+
+    if (!existingAppointment) {
+      return res.status(404).json({ success: false, message: "Appointment not found." });
+    }
+
+    if (existingAppointment.appointmentStatus !== "pending") {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Cannot reject appointment with status: ${existingAppointment.appointmentStatus}` 
+      });
+    }
+
     const result = await db.collection("Appointments").updateOne(
       { _id: new ObjectId(appointmentId) },
       {
         $set: {
           appointmentStatus: "rejected",
           rejectionReason: reason || "Doctor rejected the request",
-          rejectedAt: new Date()
+          rejectedAt: new Date(),
+          updatedAt: new Date()
         }
       }
     );
@@ -436,7 +553,6 @@ router.get("/check-restriction/:email", async (req, res) => {
     const db = await connectToDatabase();
     const userEmail = decodeURIComponent(req.params.email).toLowerCase();
 
-    // CHECK USER FROM USER COLLECTION
     const user = await db.collection("user").findOne({
       email: userEmail
     });
@@ -445,7 +561,6 @@ router.get("/check-restriction/:email", async (req, res) => {
       return res.status(200).json({ success: true, status: "active" });
     }
 
-    // Check if user is banned
     if (user.status === "banned") {
       return res.status(200).json({
         success: true,
@@ -454,13 +569,11 @@ router.get("/check-restriction/:email", async (req, res) => {
       });
     }
 
-    // Check if user is temporarily restricted
     if (user.status === "restricted" && user.restrictedUntil) {
       const now = new Date();
       const restrictionUntil = new Date(user.restrictedUntil);
 
       if (now > restrictionUntil) {
-        // Restriction expired - auto-restore
         await db.collection("user").updateOne(
           { email: userEmail },
           { 
@@ -471,7 +584,6 @@ router.get("/check-restriction/:email", async (req, res) => {
         return res.status(200).json({ success: true, status: "active" });
       }
 
-      // Still restricted
       return res.status(200).json({
         success: true,
         status: "restricted",
@@ -480,12 +592,70 @@ router.get("/check-restriction/:email", async (req, res) => {
       });
     }
 
-    // User is active
     res.status(200).json({ success: true, status: "active" });
   } catch (error) {
     console.error("Restriction check failed:", error);
     res.status(500).json({ success: false, message: "Failed to check restriction." });
   }
+});
+
+// =========================================================================
+// POST: Stripe Webhook - Updates payment status
+// =========================================================================
+router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+  } catch (err) {
+    console.error("Webhook error:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const appointmentId = session.metadata?.appointmentId;
+
+    if (appointmentId) {
+      try {
+        const db = await connectToDatabase();
+        // ✅ UPDATE EXISTING APPOINTMENT - DO NOT CREATE NEW
+        await db.collection("Appointments").updateOne(
+          { _id: new ObjectId(appointmentId) },
+          { 
+            $set: { 
+              paymentStatus: "paid",
+              paymentId: session.payment_intent,
+              paidAt: new Date(),
+              updatedAt: new Date()
+            } 
+          }
+        );
+        
+        await db.collection("Payments").updateOne(
+          { appointmentId: new ObjectId(appointmentId) },
+          {
+            $set: {
+              transactionId: session.payment_intent,
+              paymentDate: new Date(),
+              paymentStatus: "paid",
+              amount: session.amount_total / 100,
+              stripeSessionId: session.id
+            }
+          },
+          { upsert: true }
+        );
+        
+        console.log(`✅ Payment confirmed for appointment ${appointmentId}`);
+      } catch (error) {
+        console.error("Webhook update failed:", error);
+      }
+    }
+  }
+
+  res.json({ received: true });
 });
 
 module.exports = router;

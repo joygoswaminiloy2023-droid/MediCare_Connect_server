@@ -21,23 +21,23 @@ router.get("/analytics", async (req, res) => {
     const totalPatients = await db.collection("user").countDocuments({ role: "patient" });
     const totalDoctors = await db.collection("Doctor").countDocuments();
     const totalAppointments = await db.collection("Appointments").countDocuments();
-    
+
     // ── Get Reviews Statistics ──────────────────────────────────────────
     const totalReviews = await db.collection("Reviews").countDocuments();
-    
+
     // Calculate average rating
     const avgRatingResult = await db.collection("Reviews").aggregate([
       { $group: { _id: null, averageRating: { $avg: "$rating" } } }
     ]).toArray();
-    
-    const averageRating = avgRatingResult.length > 0 
-      ? parseFloat(avgRatingResult[0].averageRating.toFixed(1)) 
+
+    const averageRating = avgRatingResult.length > 0
+      ? parseFloat(avgRatingResult[0].averageRating.toFixed(1))
       : 0;
 
     // Get recent reviews (last 30 days)
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    
+
     const recentReviews = await db.collection("Reviews").countDocuments({
       createdAt: { $gte: thirtyDaysAgo }
     });
@@ -45,9 +45,9 @@ router.get("/analytics", async (req, res) => {
     // Get previous month reviews for growth calculation
     const sixtyDaysAgo = new Date();
     sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
-    
+
     const previousMonthReviews = await db.collection("Reviews").countDocuments({
-      createdAt: { 
+      createdAt: {
         $gte: sixtyDaysAgo,
         $lt: thirtyDaysAgo
       }
@@ -66,12 +66,12 @@ router.get("/analytics", async (req, res) => {
     let doctorPerformance = [];
     try {
       doctorPerformance = await db.collection("Reviews").aggregate([
-        { 
-          $group: { 
-            _id: "$doctorId", 
-            averageRating: { $avg: { $toDouble: "$rating" } }, 
-            totalReviews: { $sum: 1 } 
-          } 
+        {
+          $group: {
+            _id: "$doctorId",
+            averageRating: { $avg: { $toDouble: "$rating" } },
+            totalReviews: { $sum: 1 }
+          }
         },
         { $sort: { averageRating: -1 } },
         { $limit: 5 }
@@ -90,10 +90,10 @@ router.get("/analytics", async (req, res) => {
             if (doc) name = doc.doctorName;
           }
         } catch {}
-        return { 
-          name, 
-          rating: parseFloat(perf.averageRating.toFixed(1)), 
-          reviews: perf.totalReviews 
+        return {
+          name,
+          rating: parseFloat(perf.averageRating.toFixed(1)),
+          reviews: perf.totalReviews
         };
       })
     );
@@ -111,12 +111,12 @@ router.get("/analytics", async (req, res) => {
         { id: 1, name: "Total Patients", value: totalPatients, change: "+12%", changeType: "increase" },
         { id: 2, name: "Total Doctors", value: totalDoctors, change: "+4%", changeType: "increase" },
         { id: 3, name: "Total Appointments", value: totalAppointments, change: "+22%", changeType: "increase" },
-        { 
-          id: 4, 
-          name: "Reviews Received", 
-          value: totalReviews, 
-          change: reviewGrowth, 
-          changeType: "increase" 
+        {
+          id: 4,
+          name: "Reviews Received",
+          value: totalReviews,
+          change: reviewGrowth,
+          changeType: "increase"
         },
       ],
       performanceData: finalPerformanceData,
@@ -293,20 +293,29 @@ router.get("/doctors", async (req, res) => {
   }
 });
 
-// PATCH: Approve/Revoke doctor verification
+// =========================================================================
+// FIXED: Approve/Revoke doctor verification with ADMIN OVERRIDE
+// _id is preserved across the DoctorApplications <-> Doctor move so the
+// frontend's optimistic state updates (and any downstream lookups like
+// Appointments.doctorId) keep pointing at the right document.
+// =========================================================================
 router.patch("/doctors/verify/:id", async (req, res) => {
   try {
     const db = await connectToDatabase();
     const { verified } = req.body;
     const docId = req.params.id;
 
+    // ✅ ADMIN OVERRIDE: This endpoint is ADMIN-ONLY
+    // No doctor session checks should happen here
+    // The admin authentication middleware should already verify admin role
+
     const oid = toObjectId(docId);
     if (!oid) {
       return res.status(400).json({ success: false, message: "Invalid doctor ID format." });
     }
 
-    if (verified) {
-      // APPROVE: Move from DoctorApplications to Doctor
+    if (verified === true) {
+      // ─── APPROVE: Move from DoctorApplications to Doctor ────────────
       const application = await db.collection("DoctorApplications").findOne({ _id: oid });
 
       if (!application) {
@@ -316,48 +325,257 @@ router.patch("/doctors/verify/:id", async (req, res) => {
         });
       }
 
-      const { _id, createdAt, ...applicationData } = application;
+      // Check if doctor already exists in Doctor collection
+      const existingDoctor = await db.collection("Doctor").findOne({
+        email: application.email
+      });
 
-      await db.collection("Doctor").updateOne(
-        { email: applicationData.email },
-        {
-          $set: { ...applicationData, verificationStatus: "verified", approvedAt: new Date() },
-          $setOnInsert: { createdAt: createdAt || new Date() }
-        },
-        { upsert: true }
-      );
+      if (existingDoctor) {
+        return res.status(409).json({
+          success: false,
+          message: "This doctor is already approved and live."
+        });
+      }
 
+      // Keep the original _id so the doctor's identity stays stable
+      // across application -> live -> revoked -> reapproved cycles.
+      const { createdAt, ...applicationData } = application;
+
+      await db.collection("Doctor").insertOne({
+        ...applicationData, // includes the original _id
+        verificationStatus: "verified",
+        isLive: true,
+        approvedAt: new Date(),
+        createdAt: createdAt || new Date()
+      });
+
+      // Remove from applications
       await db.collection("DoctorApplications").deleteOne({ _id: oid });
 
-      return res.status(200).json({ success: true, message: "Doctor approved and now live." });
+      return res.status(200).json({
+        success: true,
+        message: "Doctor approved and now live.",
+        action: "approved"
+      });
 
     } else {
-      // REVOKE: Doctor (live) → DoctorApplications (staging)
+      // ─── REVOKE: Doctor (live) → DoctorApplications (staging) ──────
+
+      // First check if doctor exists and is live
       const liveDoctor = await db.collection("Doctor").findOne({ _id: oid });
 
       if (!liveDoctor) {
-        return res.status(404).json({ success: false, message: "Live doctor record not found." });
+        return res.status(404).json({
+          success: false,
+          message: "Live doctor record not found."
+        });
       }
 
-      const { _id, createdAt, ...doctorData } = liveDoctor;
+      // Check if doctor is already in pending applications
+      const existingApplication = await db.collection("DoctorApplications").findOne({
+        email: liveDoctor.email
+      });
 
-      await db.collection("DoctorApplications").updateOne(
-        { email: doctorData.email },
-        {
-          $set: { ...doctorData, verificationStatus: "pending", revokedAt: new Date() },
-          $setOnInsert: { createdAt: createdAt || new Date() }
-        },
-        { upsert: true }
-      );
+      if (existingApplication) {
+        return res.status(409).json({
+          success: false,
+          message: "This doctor already has a pending application."
+        });
+      }
 
+      // Check if doctor has active appointments
+      const activeAppointments = await db.collection("Appointments").countDocuments({
+        doctorId: oid,
+        appointmentStatus: { $in: ["pending", "confirmed"] }
+      });
+
+      if (activeAppointments > 0) {
+        return res.status(409).json({
+          success: false,
+          message: `Cannot revoke verification. Doctor has ${activeAppointments} active appointment(s). Cancel them first.`
+        });
+      }
+
+      // Keep the original _id here too.
+      const { createdAt, ...doctorData } = liveDoctor;
+
+      // Move to applications with pending status
+      await db.collection("DoctorApplications").insertOne({
+        ...doctorData, // includes the original _id
+        verificationStatus: "pending",
+        revokedAt: new Date(),
+        createdAt: createdAt || new Date()
+      });
+
+      // Remove from live doctors
       await db.collection("Doctor").deleteOne({ _id: oid });
 
-      return res.status(200).json({ success: true, message: "Verification revoked." });
+      return res.status(200).json({
+        success: true,
+        message: "Verification revoked. Doctor moved to pending applications.",
+        action: "revoked"
+      });
     }
 
   } catch (error) {
     console.error("Verification toggle failure:", error);
-    res.status(500).json({ success: false, message: "Failed to alter certification status." });
+    res.status(500).json({
+      success: false,
+      message: "Failed to alter certification status.",
+      error: error.message
+    });
+  }
+});
+
+// =========================================================================
+// Force revoke verification (admin override - bypasses appointment checks)
+// _id preserved here too. Since this is an upsert matched by email (not by
+// _id), _id can only be set on INSERT (via $setOnInsert) — if it were put
+// in $set and an existing application document with a different _id
+// already matched by email, MongoDB would reject the update for trying to
+// alter an immutable _id field.
+// =========================================================================
+router.patch("/doctors/force-revoke/:id", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const docId = req.params.id;
+    const { force = false } = req.body;
+
+    const oid = toObjectId(docId);
+    if (!oid) {
+      return res.status(400).json({ success: false, message: "Invalid doctor ID format." });
+    }
+
+    // Get the live doctor
+    const liveDoctor = await db.collection("Doctor").findOne({ _id: oid });
+
+    if (!liveDoctor) {
+      return res.status(404).json({
+        success: false,
+        message: "Live doctor record not found."
+      });
+    }
+
+    // Force delete even if there are appointments.
+    // _id is stripped out of doctorData because it can't go in $set on an
+    // upsert (immutable field). It's reattached via $setOnInsert below.
+    const { _id, createdAt, ...doctorData } = liveDoctor;
+
+    // Move to applications
+    await db.collection("DoctorApplications").updateOne(
+      { email: doctorData.email },
+      {
+        $set: {
+          ...doctorData,
+          verificationStatus: "pending",
+          revokedAt: new Date(),
+          forceRevoked: true,
+          forceRevokedAt: new Date()
+        },
+        $setOnInsert: { _id: oid, createdAt: createdAt || new Date() }
+      },
+      { upsert: true }
+    );
+
+    // Remove from live doctors
+    await db.collection("Doctor").deleteOne({ _id: oid });
+
+    return res.status(200).json({
+      success: true,
+      message: "Verification force-revoked successfully.",
+      action: "force_revoked"
+    });
+
+  } catch (error) {
+    console.error("Force revoke failed:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to force revoke verification.",
+      error: error.message
+    });
+  }
+});
+
+// =========================================================================
+// Force approve doctor (admin override)
+// Same _id-preservation rule as force-revoke: only safe to set _id on
+// insert, never in $set on an update of a potentially pre-existing doc.
+// =========================================================================
+router.patch("/doctors/force-approve/:id", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const docId = req.params.id;
+
+    const oid = toObjectId(docId);
+    if (!oid) {
+      return res.status(400).json({ success: false, message: "Invalid doctor ID format." });
+    }
+
+    // Get the application
+    const application = await db.collection("DoctorApplications").findOne({ _id: oid });
+
+    if (!application) {
+      return res.status(404).json({
+        success: false,
+        message: "Application not found."
+      });
+    }
+
+    // Check if already in Doctor collection
+    const existingDoctor = await db.collection("Doctor").findOne({
+      email: application.email
+    });
+
+    if (existingDoctor) {
+      // If exists, update it instead of creating a duplicate.
+      // Strip _id from the spread — updating _id on an existing matched
+      // document would throw an immutable-field error if it differs.
+      const { _id: _appId, ...applicationFields } = application;
+
+      await db.collection("Doctor").updateOne(
+        { email: application.email },
+        {
+          $set: {
+            ...applicationFields,
+            verificationStatus: "verified",
+            isLive: true,
+            forceApproved: true,
+            forceApprovedAt: new Date(),
+            approvedAt: new Date()
+          }
+        }
+      );
+    } else {
+      // Insert new doctor — keep the original _id since this is a fresh
+      // insert and there's no immutable-field conflict.
+      const { createdAt, ...applicationData } = application;
+      await db.collection("Doctor").insertOne({
+        ...applicationData, // includes the original _id
+        verificationStatus: "verified",
+        isLive: true,
+        forceApproved: true,
+        forceApprovedAt: new Date(),
+        approvedAt: new Date(),
+        createdAt: createdAt || new Date()
+      });
+    }
+
+    // Remove from applications
+    await db.collection("DoctorApplications").deleteOne({ _id: oid });
+
+    return res.status(200).json({
+      success: true,
+      message: "Doctor force-approved successfully.",
+      action: "force_approved"
+    });
+
+  } catch (error) {
+    console.error("Force approve failed:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to force approve doctor.",
+      error: error.message
+    });
   }
 });
 
@@ -386,7 +604,7 @@ router.get("/appointments", async (req, res) => {
     const enrichedAppointments = await Promise.all(appointments.map(async (appt) => {
       const patient = await db.collection("user").findOne({ _id: toObjectId(appt.patientId) });
       const doctor = await db.collection("Doctor").findOne({ _id: toObjectId(appt.doctorId) });
-      
+
       return {
         ...appt,
         patientName: patient?.name || "Unknown Patient",
@@ -420,6 +638,43 @@ router.get("/payments", async (req, res) => {
   } catch (error) {
     console.error("Payment enrichment error:", error);
     res.status(500).json({ success: false, message: "Failed to fetch payments." });
+  }
+});
+
+// GET: Analytics with real counts
+router.get("/analytics", async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+
+    // ✅ Real counts from database
+    const totalPatients = await db.collection("user").countDocuments({ role: "patient" });
+    const totalDoctors = await db.collection("Doctor").countDocuments();
+    const totalAppointments = await db.collection("Appointments").countDocuments();
+    const totalReviews = await db.collection("Reviews").countDocuments();
+
+    // Calculate average rating
+    const avgRatingResult = await db.collection("Reviews").aggregate([
+      { $group: { _id: null, averageRating: { $avg: "$rating" } } }
+    ]).toArray();
+    
+    const averageRating = avgRatingResult.length > 0 
+      ? parseFloat(avgRatingResult[0].averageRating.toFixed(1)) 
+      : 0;
+
+    res.status(200).json({
+      success: true,
+      stats: [
+        { id: 1, name: "Total Patients", value: totalPatients, change: "+12%", changeType: "increase" },
+        { id: 2, name: "Total Doctors", value: totalDoctors, change: "+4%", changeType: "increase" },
+        { id: 3, name: "Total Appointments", value: totalAppointments, change: "+22%", changeType: "increase" },
+        { id: 4, name: "Reviews Received", value: totalReviews, change: "+8%", changeType: "increase" },
+      ],
+      averageRating,
+      totalReviews
+    });
+  } catch (error) {
+    console.error("Analytics error:", error);
+    res.status(500).json({ success: false, message: "Internal Server Analytics Error" });
   }
 });
 
